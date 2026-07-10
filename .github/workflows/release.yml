@@ -99,23 +99,28 @@ jobs:
       - name: Assert no VC++ redistributable DLL imports
         shell: pwsh
         run: |
-          $exe = "target/release/mosh-client.exe"
-          $dump = & "${env:VCToolsInstallDir}bin\Hostx64\x64\dumpbin.exe" /dependents $exe 2>$null
-          if (-not $dump) {
-            # Fallback: scan PE import strings (no VS path needed)
-            $bytes = [IO.File]::ReadAllBytes((Resolve-Path $exe))
-            $text = [Text.Encoding]::ASCII.GetString($bytes)
-            $dlls = [regex]::Matches($text, '[A-Za-z0-9_\-\.]+\.dll') |
-              ForEach-Object { $_.Value.ToLowerInvariant() } | Sort-Object -Unique
-          } else {
-            $dlls = $dump | Select-String -Pattern '\.dll' | ForEach-Object {
-              ($_.Line -replace '^\s+', '').ToLowerInvariant()
-            }
+          $exe = (Resolve-Path "target/release/mosh-client.exe").Path
+          # Prefer real PE import table via dumpbin (vswhere); never scan raw
+          # strings — static CRT may still contain the text "VCRUNTIME140.dll".
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = $null
+          if (Test-Path $vswhere) {
+            $dumpbin = & $vswhere -latest -products * -find "**/Hostx64/x64/dumpbin.exe" |
+              Select-Object -First 1
           }
+          if (-not $dumpbin) {
+            throw "dumpbin.exe not found via vswhere; cannot verify PE imports"
+          }
+          Write-Host "Using dumpbin: $dumpbin"
+          $dump = & $dumpbin /dependents $exe
+          $dlls = @($dump | ForEach-Object {
+            if ($_ -match '^\s+([A-Za-z0-9_\-\.]+\.dll)\s*$') { $Matches[1].ToLowerInvariant() }
+          } | Sort-Object -Unique)
           Write-Host "Imports:"; $dlls | ForEach-Object { Write-Host "  $_" }
-          $forbidden = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'ucrtbase.dll') +
-            ($dlls | Where-Object { $_ -like 'api-ms-win-crt-*.dll' })
-          $hits = $dlls | Where-Object { $forbidden -contains $_ }
+          $hits = $dlls | Where-Object {
+            $_ -in @('vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll','ucrtbase.dll') -or
+            $_ -like 'api-ms-win-crt-*.dll'
+          }
           if ($hits) {
             throw "Windows build still imports redistributable CRT DLLs: $($hits -join ', '). Expected +crt-static."
           }
