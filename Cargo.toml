@@ -1,0 +1,39 @@
+[package]
+name = "moshcatty"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "MoshCatty — pure Rust Mosh client, wire-compatible with stock mosh-server"
+license = "GPL-3.0-or-later"
+publish = false
+authors = ["binaricat", "Netcatty contributors"]
+repository = "https://github.com/binaricat/MoshCatty"
+homepage = "https://github.com/binaricat/MoshCatty"
+readme = "README.md"
+keywords = ["mosh", "ssh", "terminal", "udp", "netcatty"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "mosh-client"
+path = "src/bin/mosh_client.rs"
+
+[lib]
+name = "moshcatty"
+path = "src/lib.rs"
+
+[dependencies]
+aes = "0.8"
+base64 = "0.22"
+flate2 = "1"
+thiserror = "2"
+libc = "0.2"
+
+[dev-dependencies]
+hex = "0.4"
+rand = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
