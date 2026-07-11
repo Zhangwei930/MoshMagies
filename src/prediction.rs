@@ -130,8 +130,11 @@ impl Predictor {
                 if d > SRTT_TRIGGER_HIGH {
                     self.show = true;
                 } else if d <= SRTT_TRIGGER_LOW {
-                    if !self.active() {
+                    // Hold show while cell predictions exist (not cursor-only
+                    // active with empty pending — that would latch forever).
+                    if self.pending.is_empty() {
                         self.show = false;
+                        self.active = false;
                     }
                 }
                 // Underline flagging (stock FLAG_TRIGGER_*)
@@ -261,9 +264,9 @@ impl Predictor {
     }
 
     fn try_parse_arrow(&mut self, bytes: &[u8], fb: &Framebuffer) -> ArrowParse {
-        // Lone ESC in a finished chunk is control, not a pending CSI.
+        // Buffer lone ESC for a follow-up chunk (CSI may arrive split).
         if bytes.len() < 2 {
-            return ArrowParse::NotArrow(1);
+            return ArrowParse::NeedMore;
         }
         if bytes[0] != 0x1b {
             return ArrowParse::NotArrow(1);
@@ -282,11 +285,13 @@ impl Predictor {
                     self.move_cursor_left();
                     ArrowParse::Handled(3)
                 }
-                _ => ArrowParse::NotArrow(3),
+                // ESC O X — consume ESC only; leave X for normal processing
+                _ => ArrowParse::NotArrow(1),
             };
         }
         if kind != b'[' {
-            return ArrowParse::NotArrow(2);
+            // ESC + non-CSI: control ESC only, reprocess second byte
+            return ArrowParse::NotArrow(1);
         }
         let mut j = 2;
         let mut saw_param = false;
@@ -430,6 +435,8 @@ impl Predictor {
         }
         if changed && self.pending.is_empty() {
             self.active = false;
+            // Do not leave glitch latch on after preds are gone.
+            self.glitch_trigger = 0;
         }
     }
 
@@ -439,6 +446,16 @@ impl Predictor {
         if let Some(p) = self.pending.first_mut() {
             p.at = Instant::now().checked_sub(ago).unwrap_or_else(Instant::now);
         }
+    }
+
+    #[cfg(test)]
+    pub fn glitch_trigger_for_test(&self) -> u32 {
+        self.glitch_trigger
+    }
+
+    #[cfg(test)]
+    pub fn has_esc_buf_for_test(&self) -> bool {
+        !self.esc_buf.is_empty()
     }
 
     /// mosh-go `Confirm` + stock quick-confirm glitch repair.
@@ -617,6 +634,15 @@ impl DisplayPipeline {
         &self.host_fb
     }
 
+    /// Last painted framebuffer (tests / diagnostics).
+    pub fn last_shown(&self) -> Option<&Framebuffer> {
+        self.last_shown.as_ref()
+    }
+
+    pub fn using_overlay_path(&self) -> bool {
+        self.using_overlay_path
+    }
+
     /// Resize local model; returns a full redraw for the PTY when size changes.
     pub fn resize(&mut self, cols: usize, rows: usize) -> Vec<u8> {
         if cols == self.host_fb.cols && rows == self.host_fb.rows {
@@ -747,349 +773,13 @@ impl DisplayPipeline {
         self.last_shown = Some(self.host_fb.clone());
         paint
     }
-}
 
-// ---------------------------------------------------------------------------
-// Tests (ported from mosh-go predict_test.go + double-paint regression)
-// ---------------------------------------------------------------------------
+    #[cfg(test)]
+    pub fn predictor_mut_for_test(&mut self) -> &mut Predictor {
+        &mut self.predictor
+    }
+}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ansi_apply::apply_ansi;
-    use crate::framebuffer::Attr;
-
-    #[test]
-    fn env_preference_parsing() {
-        assert_eq!(
-            DisplayPreference::from_env_value("always"),
-            DisplayPreference::Always
-        );
-        assert_eq!(
-            DisplayPreference::from_env_value("NEVER"),
-            DisplayPreference::Never
-        );
-        assert_eq!(
-            DisplayPreference::from_env_value("adaptive"),
-            DisplayPreference::Adaptive
-        );
-    }
-
-    fn blank_fb() -> Framebuffer {
-        Framebuffer::new(80, 24)
-    }
-
-    #[test]
-    fn basic_echo_pending_positions() {
-        // TestPredictorBasicEcho
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_srtt(None);
-        p.set_cursor(0, 0);
-        p.keystroke(b"abc", &blank_fb());
-        assert!(p.active());
-        assert_eq!(p.pending_len(), 3);
-        assert_eq!(p.pending_char(0), Some('a'));
-        assert_eq!(p.pending_pos(0), Some((0, 0)));
-        assert_eq!(p.pending_char(1), Some('b'));
-        assert_eq!(p.pending_pos(1), Some((1, 0)));
-        assert_eq!(p.pending_char(2), Some('c'));
-        assert_eq!(p.pending_pos(2), Some((2, 0)));
-    }
-
-    #[test]
-    fn overlay_underlines_when_flagging() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"hi", &blank_fb());
-        let mut fb = blank_fb();
-        p.overlay(&mut fb);
-        assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'h');
-        assert!(fb.cell_at(0, 0).unwrap().attr.under);
-        assert_eq!(fb.cell_at(1, 0).unwrap().ch, 'i');
-        assert!(fb.cell_at(1, 0).unwrap().attr.under);
-        assert_eq!(fb.cur_x, 2);
-        assert_eq!(fb.cur_y, 0);
-    }
-
-    #[test]
-    fn overlay_no_underline_when_not_flagging() {
-        // SRTT 40ms: show on (>30) but flagging off (≤50 clears flag)
-        let mut p = Predictor::new(DisplayPreference::Adaptive);
-        p.set_srtt(Some(Duration::from_millis(100))); // show+flag on
-        assert!(p.should_show() && p.flagging());
-        p.set_srtt(Some(Duration::from_millis(40))); // flagging off; show holds (20<40≤30? 40>30 so still show)
-        // 40 > 30 → show stays true; 40 ≤ 50 → flagging false
-        assert!(p.should_show());
-        assert!(!p.flagging());
-        p.set_cursor(0, 0);
-        p.keystroke(b"a", &blank_fb());
-        let mut fb = blank_fb();
-        p.overlay(&mut fb);
-        assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'a');
-        assert!(!fb.cell_at(0, 0).unwrap().attr.under);
-    }
-
-    #[test]
-    fn confirm_all() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"ab", &blank_fb());
-        let mut fb = blank_fb();
-        fb.put_rune(0, 0, 'a', Attr::default());
-        fb.put_rune(1, 0, 'b', Attr::default());
-        fb.cur_x = 2;
-        p.confirm(&fb);
-        assert!(!p.active());
-        assert_eq!(p.pending_len(), 0);
-    }
-
-    #[test]
-    fn partial_confirm() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"abc", &blank_fb());
-        let mut fb = blank_fb();
-        fb.put_rune(0, 0, 'a', Attr::default());
-        fb.cur_x = 1;
-        p.confirm(&fb);
-        assert!(p.active());
-        assert_eq!(p.pending_len(), 2);
-        assert_eq!(p.pending_char(0), Some('b'));
-    }
-
-    #[test]
-    fn divergence_resets() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"abc", &blank_fb());
-        let mut fb = blank_fb();
-        fb.put_rune(0, 0, 'x', Attr::default());
-        fb.cur_x = 5;
-        p.confirm(&fb);
-        assert!(!p.active());
-        assert_eq!(p.cur_x(), 5);
-    }
-
-    #[test]
-    fn control_char_resets() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"ab", &blank_fb());
-        assert!(p.active());
-        p.keystroke(b"\n", &blank_fb());
-        assert!(!p.active());
-    }
-
-    #[test]
-    fn escape_resets() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"ab", &blank_fb());
-        p.keystroke(&[0x1b], &blank_fb());
-        assert!(!p.active());
-    }
-
-    #[test]
-    fn space_confirm() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"hi there", &blank_fb());
-        assert_eq!(p.pending_len(), 8);
-        let mut fb = blank_fb();
-        fb.put_rune(0, 0, 'h', Attr::default());
-        fb.put_rune(1, 0, 'i', Attr::default());
-        fb.put_rune(2, 0, ' ', Attr::default());
-        fb.cur_x = 3;
-        p.confirm(&fb);
-        assert_eq!(p.pending_len(), 5);
-        assert_eq!(p.pending_char(0), Some('t'));
-    }
-
-    #[test]
-    fn set_cursor_not_overridden_while_active() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(10, 5);
-        p.keystroke(b"x", &blank_fb());
-        p.set_cursor(0, 0);
-        assert_eq!(p.cur_x(), 11);
-    }
-
-    #[test]
-    fn overlay_does_not_touch_unpredicted() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(5, 0);
-        p.keystroke(b"x", &blank_fb());
-        let mut fb = blank_fb();
-        fb.put_rune(0, 0, 'A', Attr::default());
-        fb.put_rune(1, 0, 'B', Attr::default());
-        p.overlay(&mut fb);
-        assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'A');
-        assert_eq!(fb.cell_at(1, 0).unwrap().ch, 'B');
-        assert_eq!(fb.cell_at(5, 0).unwrap().ch, 'x');
-    }
-
-    #[test]
-    fn backspace_undoes_own_prediction() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"ab", &blank_fb());
-        assert_eq!(p.pending_len(), 2);
-        p.keystroke(&[0x7f], &blank_fb());
-        assert_eq!(p.pending_len(), 1);
-        assert_eq!(p.pending_char(0), Some('a'));
-        assert_eq!(p.cur_x(), 1);
-        p.keystroke(&[0x08], &blank_fb());
-        assert_eq!(p.pending_len(), 0);
-        assert_eq!(p.cur_x(), 0);
-    }
-
-    #[test]
-    fn left_right_arrows_move_cursor() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"hi", &blank_fb());
-        assert_eq!(p.cur_x(), 2);
-        // CSI D left
-        p.keystroke(b"\x1b[D", &blank_fb());
-        assert_eq!(p.cur_x(), 1);
-        // CSI C right
-        p.keystroke(b"\x1b[C", &blank_fb());
-        assert_eq!(p.cur_x(), 2);
-        // Still have pending
-        assert_eq!(p.pending_len(), 2);
-    }
-
-    #[test]
-    fn glitch_forces_show_on_long_pending() {
-        let mut p = Predictor::new(DisplayPreference::Adaptive);
-        p.set_srtt(Some(Duration::from_millis(5))); // would be off
-        assert!(!p.should_show());
-        // Can't keystroke when !show — set Always-like glitch via Always path
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"x", &blank_fb());
-        p.backdate_oldest_for_test(Duration::from_millis(300));
-        p.expire_stale(Instant::now());
-        // Always still shows; glitch_trigger should rise
-        assert!(p.should_show());
-    }
-
-    /// Regression: dual-write would produce "ll"; Diff path must show single "l".
-    #[test]
-    fn no_double_paint_after_host_confirms_echo() {
-        let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
-        // Prompt
-        let _ = pipe.on_host_bytes(b"\x1b[H\x1b[2J$ ");
-        // User types "ls"
-        let local = pipe.on_keystroke(b"ls");
-        assert!(!local.is_empty(), "local overlay paint expected");
-        // Server echoes with absolute CUP (relative path is also applied into host_fb)
-        // Simulate server hoststring placing l,s at columns after "$ "
-        // "$ " is cols 0,1 → echo at 2,3
-        let host = b"\x1b[1;3Hl\x1b[1;4Hs\x1b[1;5H";
-        let after = pipe.on_host_bytes(host);
-        // Final host_fb should have one l and one s
-        assert_eq!(pipe.host_fb().cell_at(2, 0).unwrap().ch, 'l');
-        assert_eq!(pipe.host_fb().cell_at(3, 0).unwrap().ch, 's');
-        // Shown screen via last_shown: no double l at 2 and 3 from prediction leftover
-        let shown = pipe.last_shown.as_ref().unwrap();
-        assert_eq!(shown.cell_at(2, 0).unwrap().ch, 'l');
-        assert_eq!(shown.cell_at(3, 0).unwrap().ch, 's');
-        // Confirmed cells should not stay underlined once fully confirmed
-        assert!(!pipe.predictor().active());
-        assert!(!shown.cell_at(2, 0).unwrap().attr.under);
-        let _ = after;
-    }
-
-    #[test]
-    fn apply_ansi_then_confirm_pipeline() {
-        let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
-        let _ = pipe.on_host_bytes(b"\x1b[1;1H");
-        let _ = pipe.on_keystroke(b"ab");
-        assert!(pipe.predictor().active());
-        // Confirm via host
-        let mut fb = Framebuffer::new(80, 24);
-        apply_ansi(&mut fb, b"\x1b[1;1Hab");
-        // Directly use confirm path through host bytes
-        let _ = pipe.on_host_bytes(b"\x1b[1;1Hab");
-        assert!(!pipe.predictor().active());
-    }
-
-    #[test]
-    fn never_mode_passthrough() {
-        let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Never);
-        let out = pipe.on_host_bytes(b"\x1b[Hhello");
-        assert_eq!(out, b"\x1b[Hhello");
-        assert!(pipe.on_keystroke(b"x").is_empty());
-    }
-
-    #[test]
-    fn expire_stale_clears_old_pending() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke(b"a", &blank_fb());
-        assert!(p.active());
-        p.backdate_oldest_for_test(Duration::from_secs(16));
-        p.expire_stale(Instant::now());
-        assert!(!p.active());
-        assert_eq!(p.pending_len(), 0);
-    }
-
-    #[test]
-    fn multibyte_utf8_one_pending() {
-        let mut p = Predictor::new(DisplayPreference::Always);
-        p.set_cursor(0, 0);
-        p.keystroke("é".as_bytes(), &blank_fb());
-        assert_eq!(p.pending_len(), 1);
-        assert_eq!(p.pending_char(0), Some('é'));
-    }
-
-    #[test]
-    fn adaptive_hysteresis_holds_while_active() {
-        let mut p = Predictor::new(DisplayPreference::Adaptive);
-        p.set_srtt(Some(Duration::from_millis(80))); // on
-        assert!(p.should_show());
-        p.set_cursor(0, 0);
-        p.keystroke(b"x", &blank_fb());
-        assert!(p.active());
-        // Drop below LOW while pending — stock holds show on.
-        p.set_srtt(Some(Duration::from_millis(5)));
-        assert!(p.should_show());
-        // After confirm empty, can demote.
-        p.reset();
-        p.set_srtt(Some(Duration::from_millis(5)));
-        assert!(!p.should_show());
-    }
-
-    #[test]
-    fn demote_emits_host_only_diff() {
-        let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
-        let _ = pipe.set_srtt(Some(Duration::from_millis(100)));
-        let _ = pipe.on_host_bytes(b"\x1b[H$ ");
-        let _ = pipe.on_keystroke(b"ab");
-        assert!(pipe.predictor().active());
-        // Force demote by resetting then low RTT
-        // Need inactive for demote: confirm first then low RTT.
-        let _ = pipe.on_host_bytes(b"\x1b[1;3Hab");
-        assert!(!pipe.predictor().active());
-        let paint = pipe.set_srtt(Some(Duration::from_millis(1)));
-        // Demote with using_overlay_path should Diff host-only (may be empty if already synced).
-        let _ = paint;
-        assert!(!pipe.predictor().should_show());
-    }
-
-    #[test]
-    fn pipeline_tick_expires_and_repaints() {
-        let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
-        let _ = pipe.on_host_bytes(b"\x1b[H");
-        let _ = pipe.on_keystroke(b"z");
-        assert!(pipe.predictor().active());
-        // Backdate via predictor
-        // SAFETY: test-only API
-        // We need access - use confirm timeout path via expire on predictor through tick
-        // Manually: expire with future won't work; use backdate on predictor
-        // DisplayPipeline doesn't expose mut predictor — use Always + host confirm instead.
-        let _ = pipe.on_host_bytes(b"\x1b[1;1Hz");
-        assert!(!pipe.predictor().active());
-    }
-}
+#[path = "prediction_tests.rs"]
+mod tests;
