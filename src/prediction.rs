@@ -30,8 +30,9 @@ const GLITCH_THRESHOLD: Duration = Duration::from_millis(250);
 const GLITCH_FLAG_THRESHOLD: Duration = Duration::from_millis(5000);
 const GLITCH_REPAIR_COUNT: u32 = 10;
 
-/// mosh-go `predictionTimeout` (also bounds pending lifetime).
-const PREDICTION_TIMEOUT: Duration = Duration::from_millis(500);
+/// Bound pending lifetime. Longer than mosh-go's 500ms so high-latency
+/// links can still confirm (stock uses frame-ack expiry, not a short wall clock).
+const PREDICTION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayPreference {
@@ -85,8 +86,8 @@ pub struct Predictor {
     flagging: bool,
     /// Stock glitch_trigger: force show/underline when preds hang.
     glitch_trigger: u32,
-    /// Previous byte for ESC O → [ translation (application cursor keys).
-    last_byte: u8,
+    /// Partial CSI/SS3 assembly across keystroke chunks (stock keeps a parser).
+    esc_buf: Vec<u8>,
 }
 
 impl Predictor {
@@ -102,7 +103,7 @@ impl Predictor {
             show: matches!(preference, DisplayPreference::Always),
             flagging: matches!(preference, DisplayPreference::Always),
             glitch_trigger: 0,
-            last_byte: 0,
+            esc_buf: Vec::new(),
         }
     }
 
@@ -185,99 +186,64 @@ impl Predictor {
 
     /// mosh-go `Active`.
     pub fn active(&self) -> bool {
-        self.active && !self.pending.is_empty()
+        // Include cursor-only prediction (arrows / BS with empty pending).
+        self.active
     }
 
     /// Process keystrokes. `fb` is the host Framebuffer (for width / last-col).
-    ///
-    /// - Printable → pending cell + advance cursor (mosh-go / stock Print)
-    /// - BS/DEL → undo/shift pending (stock), not full Reset
-    /// - CSI C/D / SS3 C/D → left/right cursor (stock)
-    /// - Other controls / CSI → become_tentative (stock)
     pub fn keystroke(&mut self, input: &[u8], fb: &Framebuffer) {
         if !self.show {
             self.reset();
             return;
         }
+        let data: Vec<u8> = if self.esc_buf.is_empty() {
+            input.to_vec()
+        } else {
+            let mut v = std::mem::take(&mut self.esc_buf);
+            v.extend_from_slice(input);
+            v
+        };
         let mut i = 0;
-        while i < input.len() {
-            let b = input[i];
-            // ESC sequences
-            if b == 0x1b {
-                i += 1;
-                if i >= input.len() {
-                    self.become_tentative();
-                    break;
-                }
-                // Application cursor: ESC O A/B/C/D → treat like ESC [ 
-                let next = input[i];
-                if next == b'O' || next == b'[' {
-                    let is_ss3 = next == b'O';
-                    i += 1;
-                    // Collect CSI params until final
-                    let mut final_b = 0u8;
-                    while i < input.len() {
-                        let c = input[i];
-                        i += 1;
-                        if (b'@'..=b'~').contains(&c) {
-                            final_b = c;
-                            break;
-                        }
+        while i < data.len() {
+            if data[i] == 0x1b {
+                match self.try_parse_arrow(&data[i..], fb) {
+                    ArrowParse::NeedMore => {
+                        self.esc_buf = data[i..].to_vec();
+                        return;
                     }
-                    if final_b == 0 {
+                    ArrowParse::Handled(n) => {
+                        i += n;
+                        continue;
+                    }
+                    ArrowParse::NotArrow(n) => {
+                        i += n.max(1);
                         self.become_tentative();
-                        break;
+                        self.esc_buf.clear();
+                        continue;
                     }
-                    // Only bare CSI C/D (or SS3 C/D) are predicted
-                    if (is_ss3 || true) && final_b == b'C' {
-                        self.move_cursor_right(fb);
-                    } else if final_b == b'D' {
-                        self.move_cursor_left();
-                    } else {
-                        self.become_tentative();
-                    }
-                    self.last_byte = final_b;
-                    continue;
                 }
-                self.become_tentative();
-                self.last_byte = next;
-                i += 1;
-                continue;
             }
 
-            let (ch, len) = decode_utf8_char(input, i);
+            let (ch, len) = decode_utf8_char(&data, i);
             i += len;
-            self.last_byte = if len == 1 { b } else { 0 };
 
             if ch == '\u{FFFD}' && len == 1 {
                 self.become_tentative();
                 continue;
             }
-
-            // Backspace / DEL — stock predicts erase, does not full-reset
             if ch == '\u{08}' || ch == '\u{7f}' {
-                self.predict_backspace(fb);
+                self.predict_backspace();
                 continue;
             }
-
-            // Other C0 controls (CR, LF, Tab, Ctrl-C, …)
             if (ch as u32) < 0x20 {
                 self.become_tentative();
-                // CR: move to col 0 like stock newline_carriage_return (cursor only)
                 if ch == '\r' {
                     self.cur_x = 0;
                 }
                 continue;
             }
-
             if is_print(ch) {
-                // Wide glyphs: stock become_tentative (wcwidth != 1)
-                if unicode_width_approx(ch) != 1 {
-                    self.become_tentative();
-                    continue;
-                }
-                // Last column is tricky (stock)
-                if self.cur_x + 1 >= fb.cols {
+                if unicode_width_approx(ch) != 1 || self.cur_x + 1 >= fb.cols {
                     self.become_tentative();
                     continue;
                 }
@@ -294,47 +260,100 @@ impl Predictor {
         }
     }
 
+    fn try_parse_arrow(&mut self, bytes: &[u8], fb: &Framebuffer) -> ArrowParse {
+        // Lone ESC in a finished chunk is control, not a pending CSI.
+        if bytes.len() < 2 {
+            return ArrowParse::NotArrow(1);
+        }
+        if bytes[0] != 0x1b {
+            return ArrowParse::NotArrow(1);
+        }
+        let kind = bytes[1];
+        if kind == b'O' {
+            if bytes.len() < 3 {
+                return ArrowParse::NeedMore;
+            }
+            return match bytes[2] {
+                b'C' => {
+                    self.move_cursor_right(fb);
+                    ArrowParse::Handled(3)
+                }
+                b'D' => {
+                    self.move_cursor_left();
+                    ArrowParse::Handled(3)
+                }
+                _ => ArrowParse::NotArrow(3),
+            };
+        }
+        if kind != b'[' {
+            return ArrowParse::NotArrow(2);
+        }
+        let mut j = 2;
+        let mut saw_param = false;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if (b'0'..=b'9').contains(&c) || c == b';' {
+                saw_param = true;
+                j += 1;
+                continue;
+            }
+            if (b'@'..=b'~').contains(&c) {
+                j += 1;
+                if saw_param {
+                    return ArrowParse::NotArrow(j);
+                }
+                return match c {
+                    b'C' => {
+                        self.move_cursor_right(fb);
+                        ArrowParse::Handled(j)
+                    }
+                    b'D' => {
+                        self.move_cursor_left();
+                        ArrowParse::Handled(j)
+                    }
+                    _ => ArrowParse::NotArrow(j),
+                };
+            }
+            if (b' '..=b'/').contains(&c) {
+                return ArrowParse::NotArrow(j + 1);
+            }
+            j += 1;
+        }
+        ArrowParse::NeedMore
+    }
+
     fn move_cursor_left(&mut self) {
         if self.cur_x > 0 {
             self.cur_x -= 1;
-            self.active = self.active || !self.pending.is_empty();
+            self.active = true;
         }
     }
 
     fn move_cursor_right(&mut self, fb: &Framebuffer) {
         if self.cur_x + 1 < fb.cols {
             self.cur_x += 1;
-            self.active = self.active || !self.pending.is_empty();
+            self.active = true;
         }
     }
 
-    /// Stock-ish backspace on the pending-list model.
-    ///
-    /// 1. If we just typed on this row, pop the last contiguous prediction.
-    /// 2. Else shift pending cells left on this row from the cursor (insert BS).
-    /// 3. Always move cursor left when possible.
-    fn predict_backspace(&mut self, fb: &Framebuffer) {
+    /// Undo own last pending glyph, or shift own pending on the row.
+    /// Does not invent host-cell spaces (those race Confirm).
+    fn predict_backspace(&mut self) {
         if self.cur_x == 0 {
             return;
         }
         let cx = self.cur_x - 1;
         let cy = self.cur_y;
-
-        // Case 1: undo our own last glyph at (cx, cy)
         if let Some(last) = self.pending.last() {
             if last.epoch == self.epoch && last.x == cx && last.y == cy {
                 self.pending.pop();
                 self.cur_x = cx;
-                if self.pending.is_empty() {
-                    self.active = false;
-                }
+                self.active = true;
                 return;
             }
         }
-
-        // Case 2: insert-mode shift among pending on this row
-        self.cur_x = cx;
         let mut next = Vec::with_capacity(self.pending.len());
+        let mut touched = false;
         for p in self.pending.drain(..) {
             if p.epoch != self.epoch || p.y != cy {
                 next.push(p);
@@ -343,37 +362,17 @@ impl Predictor {
             if p.x < cx {
                 next.push(p);
             } else if p.x > cx {
-                next.push(Prediction {
-                    x: p.x - 1,
-                    ..p
-                });
-            }
-            // p.x == cx: deleted
-        }
-        // If nothing pending covers the gap, predict a space from host shift:
-        // show host cell at cx+1 moved to cx when available.
-        let has_at_cx = next.iter().any(|p| p.y == cy && p.x == cx);
-        if !has_at_cx {
-            if let Some(src) = fb.cell_at(cx + 1, cy) {
-                next.push(Prediction {
-                    ch: if src.ch == '\0' { ' ' } else { src.ch },
-                    x: cx,
-                    y: cy,
-                    epoch: self.epoch,
-                    at: Instant::now(),
-                });
+                next.push(Prediction { x: p.x - 1, ..p });
+                touched = true;
             } else {
-                next.push(Prediction {
-                    ch: ' ',
-                    x: cx,
-                    y: cy,
-                    epoch: self.epoch,
-                    at: Instant::now(),
-                });
+                touched = true;
             }
         }
         self.pending = next;
-        self.active = !self.pending.is_empty();
+        self.cur_x = cx;
+        if touched || !self.pending.is_empty() {
+            self.active = true;
+        }
     }
 
     /// Stock `become_tentative`: bump epoch so old pending is ignored; keep
@@ -392,7 +391,7 @@ impl Predictor {
         self.active = false;
         self.confirmed = 0;
         self.glitch_trigger = 0;
-        self.last_byte = 0;
+        self.esc_buf.clear();
     }
 
     /// mosh-go `SetCursor` — only tracks server cursor when inactive.
@@ -444,7 +443,13 @@ impl Predictor {
 
     /// mosh-go `Confirm` + stock quick-confirm glitch repair.
     pub fn confirm(&mut self, fb: &Framebuffer) {
-        if !self.active || self.pending.is_empty() {
+        if self.pending.is_empty() {
+            self.active = false;
+            self.cur_x = fb.cur_x;
+            self.cur_y = fb.cur_y;
+            return;
+        }
+        if !self.active {
             self.cur_x = fb.cur_x;
             self.cur_y = fb.cur_y;
             return;
@@ -542,6 +547,12 @@ fn unicode_width_approx(ch: char) -> usize {
     }
 }
 
+enum ArrowParse {
+    Handled(usize),
+    NeedMore,
+    NotArrow(usize),
+}
+
 fn is_print(ch: char) -> bool {
     !ch.is_control()
 }
@@ -624,22 +635,25 @@ impl DisplayPipeline {
 
     /// Returns any ANSI that must be written when adaptive mode flips.
     pub fn set_srtt(&mut self, srtt: Option<Duration>) -> Vec<u8> {
-        let was = self.predictor.should_show();
+        let was_show = self.predictor.should_show();
+        let was_flag = self.predictor.flagging();
         self.predictor.set_srtt(srtt);
-        let now = self.predictor.should_show();
-        if was && !now {
-            // Demote: clear pending and Diff host-only onto the PTY so
-            // underlines do not stick after last_shown is rebased.
+        let now_show = self.predictor.should_show();
+        let now_flag = self.predictor.flagging();
+        if was_show && !now_show {
             self.predictor.reset();
             self.using_overlay_path = false;
             return self.render_host_only();
         }
-        if !was && now {
-            // Promote: seed last_shown from host before first overlay Diff.
+        if !was_show && now_show {
             if self.last_shown.is_none() {
                 self.last_shown = Some(self.host_fb.clone());
             }
             self.using_overlay_path = true;
+        }
+        // Flagging flip must re-Diff so underlines appear/clear (stock redraws).
+        if now_show && was_flag != now_flag && self.using_overlay_path {
+            return self.render_overlay_path();
         }
         Vec::new()
     }
@@ -649,13 +663,20 @@ impl DisplayPipeline {
         if !self.predictor.should_show() && !self.using_overlay_path {
             return Vec::new();
         }
-        let before = self.predictor.pending_len();
+        let before_len = self.predictor.pending_len();
+        let before_flag = self.predictor.flagging();
+        let before_show = self.predictor.should_show();
         self.predictor.expire_stale(now);
-        let after = self.predictor.pending_len();
-        if before != after {
-            if after == 0 && !self.predictor.should_show() {
+        let after_len = self.predictor.pending_len();
+        let after_flag = self.predictor.flagging();
+        let after_show = self.predictor.should_show();
+        if before_len != after_len || before_flag != after_flag || before_show != after_show {
+            if after_len == 0 && !after_show {
                 self.using_overlay_path = false;
                 return self.render_host_only();
+            }
+            if after_show {
+                self.using_overlay_path = true;
             }
             return self.render_overlay_path();
         }
@@ -1008,7 +1029,7 @@ mod tests {
         p.set_cursor(0, 0);
         p.keystroke(b"a", &blank_fb());
         assert!(p.active());
-        p.backdate_oldest_for_test(Duration::from_millis(600));
+        p.backdate_oldest_for_test(Duration::from_secs(16));
         p.expire_stale(Instant::now());
         assert!(!p.active());
         assert_eq!(p.pending_len(), 0);
