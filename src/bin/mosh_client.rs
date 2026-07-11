@@ -115,7 +115,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        display.set_srtt(client.srtt());
+        let mode_paint = display.set_srtt(client.srtt());
+        if !mode_paint.is_empty() {
+            stdout.write_all(&mode_paint)?;
+            stdout.flush()?;
+        }
 
         let host_paint = client.poll()?;
         if !host_paint.is_empty() {
@@ -124,6 +128,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 stdout.write_all(&out)?;
                 stdout.flush()?;
             }
+        }
+
+        // mosh-go ExpireStale: tick even when the server is quiet.
+        let tick_paint = display.tick(Instant::now());
+        if !tick_paint.is_empty() {
+            stdout.write_all(&tick_paint)?;
+            stdout.flush()?;
         }
 
         match stdin_rx.try_recv() {
@@ -163,7 +174,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cur_cols = c;
                     cur_rows = r;
                     client.resize(c, r);
-                    display.resize(c as usize, r as usize);
+                    let redraw = display.resize(c as usize, r as usize);
+                    if !redraw.is_empty() {
+                        stdout.write_all(&redraw)?;
+                        stdout.flush()?;
+                    }
                 }
             }
             last_resize_check = Instant::now();

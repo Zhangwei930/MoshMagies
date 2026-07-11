@@ -5,22 +5,26 @@
 
 use crate::framebuffer::{Attr, Color, ColorType, Framebuffer};
 
-/// Parser pen state while consuming hoststring.
-#[derive(Debug, Clone)]
-struct Pen {
-    attr: Attr,
+/// Sticky SGR pen across HostBytes chunks (real PTYs keep attributes).
+#[derive(Debug, Clone, Default)]
+pub struct AnsiPen {
+    pub attr: Attr,
 }
 
 /// Apply an ANSI/hoststring fragment into `fb` (mutates cells + cursor).
+/// Resets pen to default (call [`apply_ansi_with_pen`] to keep sticky SGR).
 pub fn apply_ansi(fb: &mut Framebuffer, data: &[u8]) {
-    let mut pen = Pen {
-        attr: Attr::default(),
-    };
+    let mut pen = AnsiPen::default();
+    apply_ansi_with_pen(fb, &mut pen, data);
+}
+
+/// Like [`apply_ansi`] but preserves `pen` across calls.
+pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8]) {
     let mut i = 0;
     while i < data.len() {
         let b = data[i];
         if b == 0x1b {
-            i = consume_escape(fb, &mut pen, data, i);
+            i = consume_escape(fb, pen, data, i);
             continue;
         }
         if b == b'\r' {
@@ -29,7 +33,13 @@ pub fn apply_ansi(fb: &mut Framebuffer, data: &[u8]) {
             continue;
         }
         if b == b'\n' {
-            fb.cur_y = (fb.cur_y + 1).min(fb.rows.saturating_sub(1));
+            // Scroll when at bottom (stock Display often uses CR+LF scroll).
+            if fb.cur_y + 1 >= fb.rows {
+                scroll_up(fb, 1);
+                fb.cur_y = fb.rows.saturating_sub(1);
+            } else {
+                fb.cur_y += 1;
+            }
             i += 1;
             continue;
         }
@@ -66,6 +76,26 @@ pub fn apply_ansi(fb: &mut Framebuffer, data: &[u8]) {
     }
 }
 
+fn scroll_up(fb: &mut Framebuffer, lines: usize) {
+    let lines = lines.min(fb.rows);
+    if lines == 0 {
+        return;
+    }
+    let cols = fb.cols;
+    let rows = fb.rows;
+    if lines >= rows {
+        for c in fb.cells.iter_mut() {
+            *c = Default::default();
+        }
+        return;
+    }
+    fb.cells.rotate_left(lines * cols);
+    let start = (rows - lines) * cols;
+    for c in &mut fb.cells[start..] {
+        *c = Default::default();
+    }
+}
+
 fn decode_utf8_at(data: &[u8], i: usize) -> (char, usize) {
     let b0 = data[i];
     if b0 < 0x80 {
@@ -89,7 +119,7 @@ fn decode_utf8_at(data: &[u8], i: usize) -> (char, usize) {
     }
 }
 
-fn consume_escape(fb: &mut Framebuffer, pen: &mut Pen, data: &[u8], start: usize) -> usize {
+fn consume_escape(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8], start: usize) -> usize {
     let mut i = start + 1;
     if i >= data.len() {
         return data.len();
@@ -164,7 +194,7 @@ fn parse_params(params: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-fn apply_csi(fb: &mut Framebuffer, pen: &mut Pen, params: &[u8], final_byte: u8) {
+fn apply_csi(fb: &mut Framebuffer, pen: &mut AnsiPen, params: &[u8], final_byte: u8) {
     let private = params.first() == Some(&b'?');
     let nums = parse_params(params);
 
@@ -304,7 +334,7 @@ fn erase_to_cursor(fb: &mut Framebuffer) {
     }
 }
 
-fn apply_sgr(pen: &mut Pen, nums: &[u32]) {
+fn apply_sgr(pen: &mut AnsiPen, nums: &[u32]) {
     if nums.is_empty() {
         pen.attr = Attr::default();
         return;

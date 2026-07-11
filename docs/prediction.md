@@ -50,8 +50,10 @@ Client.send_keys(keys)         // still UDP to server
 | Confirm | cull + epochs | Confirm(fb) | Confirm(fb) |
 | Paint | new_frame(last, desired) | Diff | Diff |
 | Control/BS | tentative / row shift | **Reset all** | **Reset all** (go) |
-| Adaptive | 30/20 ms hysteresis | n/a | SRTT ≥ 20 ms |
+| Adaptive | 30/20 ms hysteresis; demote only if idle | n/a | 30/20 ms hysteresis; demote only if idle (stock) |
 | Underline | flagging hysteresis | always on pending | always on pending (go) |
+| Expire | glitch timers | 500 ms stale | 500 ms + client `tick` |
+| Demote repaint | re-diff host FB | n/a | Diff host-only before passthrough |
 
 ## Env
 
