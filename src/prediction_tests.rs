@@ -360,12 +360,12 @@ fn original_ch_no_credit_for_noop() {
     p.keystroke(b"a", &host); // original_ch = 'a', pred = 'a'
     host.cur_x = 1;
     p.confirm(&host);
-    // no_credit should not advance confirmed_epoch to new epoch
-    assert!(
-        p.confirmed_epoch_for_test() <= conf_before
-            || p.confirmed_epoch_for_test() < ep
-            || p.pending_len() == 0,
-        "noop match must not falsely prove new band"
+    // Strict: CorrectNoCredit must not advance confirmed_epoch to the new band.
+    assert_eq!(p.pending_len(), 0, "matched pred drains");
+    assert_eq!(
+        p.confirmed_epoch_for_test(),
+        conf_before,
+        "noop match must not prove new band (ep was {ep})"
     );
 }
 
@@ -709,16 +709,34 @@ fn glitch_threshold_raises_trigger() {
 }
 
 #[test]
-fn last_column_and_wide_char_tentative() {
+fn last_column_places_unknown_and_wraps() {
     let mut p = always();
     let fb = Framebuffer::new(4, 2);
     p.set_cursor(3, 0); // last col
+    let ep_before = p.prediction_epoch_for_test();
     p.keystroke(b"x", &fb);
-    assert_eq!(p.pending_len(), 0, "last column must not predict");
+    // Stock: still places at last col (unknown), becomes tentative, wraps.
+    assert_eq!(p.pending_len(), 1, "last column still places prediction");
+    assert_eq!(p.pending_pos(0), Some((3, 0)));
+    assert_eq!(p.cur_x(), 0);
+    assert_eq!(p.cur_y(), 1);
+    assert!(p.prediction_epoch_for_test() > ep_before);
 
+    let mut p2 = always();
+    p2.set_cursor(0, 0);
+    p2.keystroke("你".as_bytes(), &blank_fb());
+    assert_eq!(p2.pending_len(), 0, "wide CJK must be tentative");
+}
+
+#[test]
+fn combining_mark_is_tentative() {
+    let mut p = always();
     p.set_cursor(0, 0);
-    p.keystroke("你".as_bytes(), &blank_fb());
-    assert_eq!(p.pending_len(), 0, "wide CJK must be tentative");
+    p.keystroke(b"e", &blank_fb());
+    assert_eq!(p.pending_len(), 1);
+    // U+0301 combining acute
+    p.keystroke("\u{0301}".as_bytes(), &blank_fb());
+    assert_eq!(p.pending_len(), 1, "combining must not add pending");
 }
 
 // ---------------------------------------------------------------------------
@@ -916,3 +934,247 @@ fn pipeline_resize_full_redraw() {
     assert_eq!(pipe.host_fb().rows, 24);
 }
 
+
+// ---------------------------------------------------------------------------
+// Fidelity hardening (cursor_exp, unknown, overwrite BS, adaptive bg, structural)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cursor_only_survives_confirm_until_frame_ack() {
+    let mut p = always();
+    p.set_frames(3, 2);
+    p.set_cursor(2, 0);
+    p.keystroke(b"\x1b[C", &blank_fb()); // right arrow
+    assert!(p.active());
+    assert_eq!(p.cur_x(), 3);
+    assert_eq!(p.pending_len(), 0);
+    // Unacked: host still at old cursor — must keep glass cursor.
+    let mut host = blank_fb();
+    host.cur_x = 2;
+    host.cur_y = 0;
+    p.confirm(&host);
+    assert!(p.active(), "cursor pred Pending until ack");
+    assert_eq!(p.cur_x(), 3);
+    // Ack + host matches predicted cursor.
+    p.set_frames(3, 4);
+    host.cur_x = 3;
+    p.confirm(&host);
+    assert!(!p.active());
+    assert_eq!(p.cur_x(), 3);
+}
+
+#[test]
+fn cursor_only_resets_on_ack_mismatch() {
+    let mut p = always();
+    p.set_frames(5, 5);
+    p.set_cursor(1, 0);
+    p.keystroke(b"\x1b[D", &blank_fb()); // left → col 0, exp=6
+    assert_eq!(p.cur_x(), 0);
+    p.set_frames(5, 6); // acked past exp
+    let mut host = blank_fb();
+    host.cur_x = 4; // disagree
+    host.cur_y = 0;
+    p.confirm(&host);
+    assert!(!p.active());
+    assert_eq!(p.cur_x(), 4, "mismatch after ack snaps to host");
+}
+
+#[test]
+fn unknown_overlay_does_not_replace_glyph() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    p.keystroke(b"a", &blank_fb());
+    p.set_unknown_pending_for_test(0);
+    let mut fb = blank_fb();
+    fb.put_rune(0, 0, 'H', Attr::default());
+    p.overlay(&mut fb);
+    assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'H', "unknown must not replace host");
+    assert!(fb.cell_at(0, 0).unwrap().attr.under, "flagging still underlines unknown");
+}
+
+#[test]
+fn overwrite_bs_clears_cell_not_shift() {
+    let mut p = always();
+    p.set_overwrite_for_test(true);
+    let mut host = blank_fb();
+    host.put_rune(0, 0, 'a', Attr::default());
+    host.put_rune(1, 0, 'b', Attr::default());
+    host.put_rune(2, 0, 'c', Attr::default());
+    host.cur_x = 2;
+    p.set_cursor(2, 0);
+    p.keystroke(&[0x7f], &host);
+    assert_eq!(p.cur_x(), 1);
+    assert_eq!(p.pending_len(), 1);
+    assert_eq!(p.pending_char(0), Some(' '));
+    assert_eq!(p.pending_pos(0), Some((1, 0)));
+}
+
+#[test]
+fn adaptive_cold_builds_background_predictions() {
+    let mut p = adaptive();
+    // Cold: show off
+    assert!(!p.should_show());
+    p.set_cursor(0, 0);
+    p.keystroke(b"hi", &blank_fb());
+    assert_eq!(p.pending_len(), 2, "stock Adaptive predicts while not showing");
+    assert!(!p.should_show());
+    // Warm up show
+    p.set_srtt(Some(Duration::from_millis(100)));
+    assert!(p.should_show());
+    let mut fb = blank_fb();
+    p.overlay(&mut fb);
+    assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'h');
+}
+
+#[test]
+fn pipeline_adaptive_background_then_show() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Adaptive);
+    let _ = pipe.on_host_bytes(b"\x1b[H");
+    // Cold keystroke: no paint
+    let paint = pipe.on_keystroke(b"xy");
+    assert!(paint.is_empty());
+    assert_eq!(pipe.predictor().pending_len(), 2);
+    // Warm: set_srtt should reveal overlay
+    let paint = pipe.set_srtt(Some(Duration::from_millis(100)));
+    assert!(
+        !paint.is_empty() || pipe.using_overlay_path(),
+        "warming Adaptive must engage overlay path"
+    );
+    assert!(pipe.predictor().should_show());
+}
+
+#[test]
+fn pipeline_structural_ich_resets_pending() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
+    let _ = pipe.on_host_bytes(b"\x1b[Habcd");
+    let _ = pipe.on_keystroke(b"z");
+    assert!(pipe.predictor().pending_len() >= 1);
+    let _ = pipe.on_host_bytes(b"\x1b[1;1H\x1b[2@"); // ICH
+    assert_eq!(
+        pipe.predictor().pending_len(),
+        0,
+        "ICH must invalidate pending geometry"
+    );
+}
+
+#[test]
+fn pipeline_split_host_csi_reassembled() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
+    let _ = pipe.on_host_bytes(b"\x1b[1;");
+    let _ = pipe.on_host_bytes(b"3HX");
+    assert_eq!(pipe.host_fb().cur_y, 0);
+    // CUP 1;3 → col 2, then X printed
+    assert_eq!(pipe.host_fb().cell_at(2, 0).unwrap().ch, 'X');
+}
+
+#[test]
+fn cross_epoch_insert_shifts_all_pending_on_row() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    p.keystroke(b"abcd", &blank_fb());
+    p.become_tentative();
+    // Move into the middle of older-epoch preds via left arrows
+    while p.cur_x() > 1 {
+        p.keystroke(b"\x1b[D", &blank_fb());
+    }
+    assert_eq!(p.cur_x(), 1);
+    let n_before = p.pending_len();
+    p.keystroke(b"X", &blank_fb());
+    let mut positions: Vec<usize> = (0..p.pending_len())
+        .filter_map(|i| p.pending_pos(i).map(|(x, _)| x))
+        .collect();
+    positions.sort();
+    assert!(
+        positions.contains(&1),
+        "insert at 1 must place/shift; positions={positions:?} n_before={n_before}"
+    );
+    assert_eq!(p.pending_char(0), Some('a'));
+    assert_eq!(p.pending_pos(0), Some((0, 0)));
+}
+
+#[test]
+fn kill_epoch_resyncs_cursor_to_host() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    p.keystroke(b"ab", &blank_fb());
+    p.become_tentative();
+    p.keystroke(b"xy", &blank_fb());
+    let mut host = blank_fb();
+    host.put_rune(0, 0, 'a', Attr::default());
+    host.put_rune(1, 0, 'b', Attr::default());
+    host.put_rune(2, 0, 'Z', Attr::default()); // not 'x'
+    host.cur_x = 3;
+    host.cur_y = 0;
+    p.confirm(&host);
+    for i in 0..p.pending_len() {
+        assert_ne!(p.pending_char(i), Some('x'));
+        assert_ne!(p.pending_char(i), Some('y'));
+    }
+    // Failed band killed; remaining empty or older band only; cursor sane.
+    if p.pending_len() == 0 {
+        assert_eq!(p.cur_x(), 3);
+        assert_eq!(p.cur_y(), 0);
+    }
+}
+
+
+#[test]
+fn ss3_up_does_not_pollute_pending() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    p.keystroke(b"a", &blank_fb());
+    assert_eq!(p.pending_len(), 1);
+    // ESC O A — SS3 up (not left/right)
+    p.keystroke(b"\x1bOA", &blank_fb());
+    assert_eq!(p.pending_len(), 1, "SS3 non-C/D must not predict O/A as glyphs");
+    assert_eq!(p.pending_char(0), Some('a'));
+}
+
+#[test]
+fn pipeline_split_ich_resets_pending() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
+    let _ = pipe.on_host_bytes(b"\x1b[Habcd");
+    let _ = pipe.on_keystroke(b"z");
+    assert!(pipe.predictor().pending_len() >= 1);
+    // Split ICH across HostBytes chunks (carry + structural scan).
+    let _ = pipe.on_host_bytes(b"\x1b[2");
+    let _ = pipe.on_host_bytes(b"@");
+    assert_eq!(
+        pipe.predictor().pending_len(),
+        0,
+        "split ICH must invalidate pending"
+    );
+}
+
+#[test]
+fn adaptive_demote_preserves_cursor_only_active() {
+    let mut p = adaptive();
+    p.set_srtt(Some(Duration::from_millis(100)));
+    p.set_frames(2, 2);
+    p.set_cursor(2, 0);
+    p.keystroke(b"\x1b[C", &blank_fb());
+    assert!(p.active());
+    assert_eq!(p.pending_len(), 0);
+    // Demote on low interval
+    p.set_srtt(Some(Duration::from_millis(5)));
+    assert!(!p.should_show());
+    assert!(p.active(), "cursor-only active must survive demote");
+    assert_eq!(p.cur_x(), 3);
+}
+
+#[test]
+fn kill_epoch_resyncs_cursor_to_host_strict() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    p.become_tentative();
+    p.keystroke(b"xy", &blank_fb());
+    let mut host = blank_fb();
+    host.put_rune(0, 0, 'Z', Attr::default());
+    host.cur_x = 5;
+    host.cur_y = 1;
+    p.confirm(&host);
+    // Failed tentative with no matched prefix → kill_epoch empties → snap cursor
+    assert_eq!(p.pending_len(), 0);
+    assert_eq!(p.cur_x(), 5);
+    assert_eq!(p.cur_y(), 1);
+}

@@ -138,12 +138,27 @@ impl Framebuffer {
         self.cells.get_mut(y * self.cols + x)
     }
 
-    pub fn put_rune(&mut self, x: usize, y: usize, ch: char, attr: Attr) {
+    /// Place a rune. Returns display columns used (1 or 2). Wide runes also
+    /// mark the following cell as a width-0 continuation when room remains.
+    pub fn put_rune(&mut self, x: usize, y: usize, ch: char, attr: Attr) -> usize {
+        let w = rune_display_width(ch);
+        // Combining/ZW: do not overwrite base cell (host model approximation).
+        if w == 0 {
+            return 0;
+        }
         if let Some(cell) = self.cell_at_mut(x, y) {
             cell.ch = ch;
-            cell.width = 1;
+            cell.width = w as u8;
             cell.attr = attr;
         }
+        if w == 2 && x + 1 < self.cols {
+            if let Some(cont) = self.cell_at_mut(x + 1, y) {
+                cont.ch = ' ';
+                cont.width = 0;
+                cont.attr = attr;
+            }
+        }
+        w
     }
 
     /// Diff this framebuffer against `old` (mosh-go `Diff`).
@@ -448,5 +463,38 @@ mod tests {
         let new = Framebuffer::new(20, 10);
         let paint = new.diff(Some(&old));
         assert!(paint.windows(4).any(|w| w == b"\x1b[2J"));
+    }
+}
+
+
+/// Approximate terminal cell width for host modeling (1 or 2).
+fn rune_display_width(ch: char) -> usize {
+    let c = ch as u32;
+    // Combining / ZW — treat as 0 so host cursor does not advance.
+    if (0x0300..=0x036F).contains(&c)
+        || (0x1AB0..=0x1AFF).contains(&c)
+        || (0x1DC0..=0x1DFF).contains(&c)
+        || (0x20D0..=0x20FF).contains(&c)
+        || (0xFE20..=0xFE2F).contains(&c)
+        || matches!(c, 0x200B | 0x200C | 0x200D | 0x2060 | 0xFEFF)
+    {
+        return 0;
+    }
+    if c < 0x1100 {
+        return 1;
+    }
+    if (0x1100..=0x115F).contains(&c)
+        || (0x2E80..=0xA4CF).contains(&c)
+        || (0xAC00..=0xD7A3).contains(&c)
+        || (0xF900..=0xFAFF).contains(&c)
+        || (0xFE10..=0xFE6F).contains(&c)
+        || (0xFF00..=0xFF60).contains(&c)
+        || (0xFFE0..=0xFFE6).contains(&c)
+        || (0x20000..=0x2FFFD).contains(&c)
+        || (0x30000..=0x3FFFD).contains(&c)
+    {
+        2
+    } else {
+        1
     }
 }

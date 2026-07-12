@@ -5,10 +5,12 @@
 
 use crate::framebuffer::{Attr, Color, ColorType, Framebuffer};
 
-/// Sticky SGR pen across HostBytes chunks (real PTYs keep attributes).
+/// Sticky SGR pen + incomplete-sequence carry across HostBytes chunks.
 #[derive(Debug, Clone, Default)]
 pub struct AnsiPen {
     pub attr: Attr,
+    /// Incomplete ESC/CSI/OSC/UTF-8 fragment carried to the next HostBytes chunk.
+    pub carry: Vec<u8>,
 }
 
 /// Apply an ANSI/hoststring fragment into `fb` (mutates cells + cursor).
@@ -18,13 +20,28 @@ pub fn apply_ansi(fb: &mut Framebuffer, data: &[u8]) {
     apply_ansi_with_pen(fb, &mut pen, data);
 }
 
-/// Like [`apply_ansi`] but preserves `pen` across calls.
+/// Like [`apply_ansi`] but preserves `pen` (and incomplete carry) across calls.
 pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8]) {
+    // Reassemble incomplete ESC/UTF-8 from the previous HostBytes chunk.
+    let buf: Vec<u8> = if pen.carry.is_empty() {
+        data.to_vec()
+    } else {
+        let mut v = std::mem::take(&mut pen.carry);
+        v.extend_from_slice(data);
+        v
+    };
+    let data = &buf[..];
     let mut i = 0;
     while i < data.len() {
         let b = data[i];
         if b == 0x1b {
-            i = consume_escape(fb, pen, data, i);
+            match consume_escape(fb, pen, data, i) {
+                EscapeConsume::Done(next) => i = next,
+                EscapeConsume::NeedMore(start) => {
+                    pen.carry = data[start..].to_vec();
+                    return;
+                }
+            }
             continue;
         }
         if b == b'\r' {
@@ -60,18 +77,40 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
             i += 1;
             continue;
         }
-        // UTF-8 printable
-        let (ch, len) = decode_utf8_at(data, i);
-        i += len;
-        if ch == '\0' {
-            continue;
-        }
-        let x = fb.cur_x;
-        let y = fb.cur_y;
-        if x < fb.cols && y < fb.rows {
-            fb.put_rune(x, y, ch, pen.attr);
-            // Advance one column; clamp to last col (no wrap).
-            fb.cur_x = (x + 1).min(fb.cols.saturating_sub(1));
+        // UTF-8 printable (may be incomplete at chunk end)
+        match decode_utf8_at(data, i) {
+            Utf8Decode::NeedMore => {
+                pen.carry = data[i..].to_vec();
+                return;
+            }
+            Utf8Decode::Char(ch, len) => {
+                i += len;
+                if ch == '\0' {
+                    continue;
+                }
+                let x = fb.cur_x;
+                let y = fb.cur_y;
+                if x < fb.cols && y < fb.rows {
+                    let w = fb.put_rune(x, y, ch, pen.attr);
+                    if w == 0 {
+                        // Combining / ZW: do not advance cursor.
+                        continue;
+                    }
+                    // DECAWM-style wrap (host model for Confirm fidelity).
+                    if x + w >= fb.cols {
+                        if y + 1 < fb.rows {
+                            fb.cur_y = y + 1;
+                            fb.cur_x = 0;
+                        } else {
+                            scroll_up(fb, 1);
+                            fb.cur_y = fb.rows.saturating_sub(1);
+                            fb.cur_x = 0;
+                        }
+                    } else {
+                        fb.cur_x = x + w;
+                    }
+                }
+            }
         }
     }
 }
@@ -96,10 +135,20 @@ fn scroll_up(fb: &mut Framebuffer, lines: usize) {
     }
 }
 
-fn decode_utf8_at(data: &[u8], i: usize) -> (char, usize) {
+enum Utf8Decode {
+    Char(char, usize),
+    NeedMore,
+}
+
+enum EscapeConsume {
+    Done(usize),
+    NeedMore(usize),
+}
+
+fn decode_utf8_at(data: &[u8], i: usize) -> Utf8Decode {
     let b0 = data[i];
     if b0 < 0x80 {
-        return (b0 as char, 1);
+        return Utf8Decode::Char(b0 as char, 1);
     }
     let width = if b0 & 0xE0 == 0xC0 {
         2
@@ -108,21 +157,21 @@ fn decode_utf8_at(data: &[u8], i: usize) -> (char, usize) {
     } else if b0 & 0xF8 == 0xF0 {
         4
     } else {
-        return ('\u{FFFD}', 1);
+        return Utf8Decode::Char('\u{FFFD}', 1);
     };
     if i + width > data.len() {
-        return ('\u{FFFD}', 1);
+        return Utf8Decode::NeedMore;
     }
     match std::str::from_utf8(&data[i..i + width]) {
-        Ok(s) => (s.chars().next().unwrap_or('\u{FFFD}'), width),
-        Err(_) => ('\u{FFFD}', 1),
+        Ok(s) => Utf8Decode::Char(s.chars().next().unwrap_or('\u{FFFD}'), width),
+        Err(_) => Utf8Decode::Char('\u{FFFD}', 1),
     }
 }
 
-fn consume_escape(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8], start: usize) -> usize {
+fn consume_escape(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8], start: usize) -> EscapeConsume {
     let mut i = start + 1;
     if i >= data.len() {
-        return data.len();
+        return EscapeConsume::NeedMore(start);
     }
     match data[i] {
         b'[' => {
@@ -138,31 +187,35 @@ fn consume_escape(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8], start: u
                 break;
             }
             if i >= data.len() {
-                return data.len();
+                return EscapeConsume::NeedMore(start);
             }
             let final_byte = data[i];
             let params = &data[param_start..i];
             i += 1;
             apply_csi(fb, pen, params, final_byte);
-            i
+            EscapeConsume::Done(i)
         }
         b']' => {
             // OSC ... BEL or ST
             i += 1;
             while i < data.len() {
                 if data[i] == 0x07 {
-                    return i + 1;
+                    return EscapeConsume::Done(i + 1);
                 }
                 if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'\\' {
-                    return i + 2;
+                    return EscapeConsume::Done(i + 2);
                 }
                 i += 1;
             }
-            data.len()
+            EscapeConsume::NeedMore(start)
         }
         _ => {
-            // Other ESC X — skip one more byte if present
-            i + 1
+            // Other ESC X — need the following byte if missing
+            if i >= data.len() {
+                EscapeConsume::NeedMore(start)
+            } else {
+                EscapeConsume::Done(i + 1)
+            }
         }
     }
 }
@@ -569,5 +622,39 @@ mod tests {
         assert_eq!(fb.cell_at(0, 0).unwrap().ch, 'a');
         assert_eq!(fb.cell_at(1, 0).unwrap().ch, 'd');
         assert_eq!(fb.cell_at(2, 0).unwrap().ch, 'e');
+    }
+
+    #[test]
+    fn split_csi_cup_reassembled_across_chunks() {
+        let mut fb = Framebuffer::new(80, 24);
+        let mut pen = AnsiPen::default();
+        apply_ansi_with_pen(&mut fb, &mut pen, b"\x1b[1;");
+        assert!(!pen.carry.is_empty(), "incomplete CSI must be carried");
+        apply_ansi_with_pen(&mut fb, &mut pen, b"5H");
+        assert!(pen.carry.is_empty());
+        assert_eq!(fb.cur_y, 0);
+        assert_eq!(fb.cur_x, 4, "CUP 1;5 → col 4");
+    }
+
+    #[test]
+    fn split_utf8_reassembled_across_chunks() {
+        let mut fb = Framebuffer::new(10, 3);
+        let mut pen = AnsiPen::default();
+        // '€' = E2 82 AC
+        apply_ansi_with_pen(&mut fb, &mut pen, &[0xE2, 0x82]);
+        assert!(!pen.carry.is_empty());
+        apply_ansi_with_pen(&mut fb, &mut pen, &[0xAC]);
+        assert!(pen.carry.is_empty());
+        assert_eq!(fb.cell_at(0, 0).unwrap().ch, '€');
+    }
+
+    #[test]
+    fn printable_wraps_to_next_row() {
+        let mut fb = Framebuffer::new(4, 3);
+        apply_ansi(&mut fb, b"\x1b[Habcd"); // fills row 0
+        assert_eq!(fb.cur_x, 0);
+        assert_eq!(fb.cur_y, 1);
+        apply_ansi(&mut fb, b"X");
+        assert_eq!(fb.cell_at(0, 1).unwrap().ch, 'X');
     }
 }
