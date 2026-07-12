@@ -34,6 +34,7 @@ const FLAG_TRIGGER_LOW: Duration = Duration::from_millis(50);
 const GLITCH_THRESHOLD: Duration = Duration::from_millis(250);
 const GLITCH_FLAG_THRESHOLD: Duration = Duration::from_millis(5000);
 const GLITCH_REPAIR_COUNT: u32 = 10;
+const GLITCH_REPAIR_MININTERVAL: Duration = Duration::from_millis(150);
 
 /// Bound pending lifetime. Longer than mosh-go's 500ms so high-latency
 /// links can still confirm (stock uses frame-ack expiry, not a short wall clock).
@@ -76,6 +77,10 @@ struct Prediction {
     at: Instant,
     /// Stock `expiration_frame` proxy: Pending while acked < this sent watermark.
     expiration_sent: u64,
+    /// Content present on host at predict time (CorrectNoCredit if match is noop).
+    original_ch: char,
+    /// Stock `unknown` — never diverge; CorrectNoCredit only.
+    unknown: bool,
 }
 
 /// mosh-go pending list + stock tentative / frame-ack / flagging / BS / arrows.
@@ -98,6 +103,11 @@ pub struct Predictor {
     /// Stock local_frame_sent / local_frame_acked (SSP state numbers).
     local_frame_sent: u64,
     local_frame_acked: u64,
+    /// Cursor-only prediction expiry (stock ConditionalCursorMove).
+    cursor_exp_sent: Option<u64>,
+    last_quick_confirmation: Option<Instant>,
+    /// Stock predict_overwrite (env MOSH_PREDICTION_OVERWRITE).
+    overwrite: bool,
 }
 
 impl Predictor {
@@ -120,6 +130,11 @@ impl Predictor {
             esc_buf: Vec::new(),
             local_frame_sent: 0,
             local_frame_acked: 0,
+            cursor_exp_sent: None,
+            last_quick_confirmation: None,
+            overwrite: std::env::var("MOSH_PREDICTION_OVERWRITE")
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false),
         }
     }
 
@@ -268,7 +283,13 @@ impl Predictor {
             if (ch as u32) < 0x20 {
                 self.become_tentative();
                 if ch == '\r' {
+                    // Stock newline_carriage_return (no scroll prediction at bottom).
                     self.cur_x = 0;
+                    if self.cur_y + 1 < fb.rows {
+                        self.cur_y += 1;
+                    }
+                    self.active = true;
+                    self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
                 }
                 continue;
             }
@@ -281,22 +302,20 @@ impl Predictor {
                 // (mirrors stock row insert; avoids duplicate cells after arrows).
                 let cx = self.cur_x;
                 let cy = self.cur_y;
-                for p in &mut self.pending {
-                    if p.epoch == self.prediction_epoch && p.y == cy && p.x >= cx {
-                        p.x = p.x.saturating_add(1);
+                if !self.overwrite {
+                    for p in &mut self.pending {
+                        if p.epoch == self.prediction_epoch && p.y == cy && p.x >= cx {
+                            p.x = p.x.saturating_add(1);
+                        }
                     }
+                    self.predict_host_insert(fb, cx, cy, ch);
+                } else {
+                    let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
+                    self.pending.push(self.make_pred(ch, cx, cy, orig, false));
+                    self.cur_x = cx.saturating_add(1);
+                    self.active = true;
+                    self.sort_pending();
                 }
-                self.pending.push(Prediction {
-                    ch,
-                    x: cx,
-                    y: cy,
-                    epoch: self.prediction_epoch,
-                    at: Instant::now(),
-                    expiration_sent: self.local_frame_sent.saturating_add(1),
-                });
-                self.cur_x = cx.saturating_add(1);
-                self.active = true;
-                self.sort_pending();
             }
         }
     }
@@ -369,6 +388,7 @@ impl Predictor {
         if self.cur_x > 0 {
             self.cur_x -= 1;
             self.active = true;
+            self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
         }
     }
 
@@ -376,11 +396,61 @@ impl Predictor {
         if self.cur_x + 1 < fb.cols {
             self.cur_x += 1;
             self.active = true;
+            self.cursor_exp_sent = Some(self.local_frame_sent.saturating_add(1));
         }
     }
 
     /// Undo own last pending glyph, shift own pending, or host-row insert BS.
     /// Host-row shifts use frame-ack Pending so Confirm will not diverge early.
+    /// Stock insert-mode printable into host line: shift host tail right, place ch.
+    fn predict_host_insert(&mut self, fb: &Framebuffer, cx: usize, cy: usize, ch: char) {
+        let exp = self.local_frame_sent.saturating_add(1);
+        let ep = self.prediction_epoch;
+        let now = Instant::now();
+        let mut last_content = cx;
+        for x in (cx..fb.cols).rev() {
+            if let Some(c) = fb.cell_at(x, cy) {
+                if c.ch != ' ' && c.ch != '\0' {
+                    last_content = x;
+                    break;
+                }
+            }
+        }
+        if last_content > cx {
+            for x in (cx + 1..=last_content).rev() {
+                let src = fb.cell_at(x - 1, cy);
+                let sch = src
+                    .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                    .unwrap_or(' ');
+                let orig = fb.cell_at(x, cy).map(|c| c.ch).unwrap_or(' ');
+                self.pending.push(Prediction {
+                    ch: sch,
+                    x,
+                    y: cy,
+                    epoch: ep,
+                    at: now,
+                    expiration_sent: exp,
+                    original_ch: orig,
+                    unknown: x + 1 >= fb.cols,
+                });
+            }
+        }
+        let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
+        self.pending.push(Prediction {
+            ch,
+            x: cx,
+            y: cy,
+            epoch: ep,
+            at: now,
+            expiration_sent: exp,
+            original_ch: orig,
+            unknown: false,
+        });
+        self.cur_x = cx.saturating_add(1);
+        self.active = true;
+        self.sort_pending();
+    }
+
     fn predict_backspace(&mut self, fb: &Framebuffer) {
         if self.cur_x == 0 {
             return;
@@ -449,6 +519,8 @@ impl Predictor {
                     epoch: ep,
                     at: now,
                     expiration_sent: exp,
+                    original_ch: ' ',
+                    unknown: x + 1 >= fb.cols.saturating_sub(1),
                 });
             }
             self.pending.push(Prediction {
@@ -458,6 +530,8 @@ impl Predictor {
                 epoch: ep,
                 at: now,
                 expiration_sent: exp,
+                original_ch: fb.cell_at(last_content, cy).map(|c| c.ch).unwrap_or(' '),
+                unknown: true,
             });
         }
         self.sort_pending();
@@ -493,6 +567,8 @@ impl Predictor {
         self.confirmed = 0;
         self.glitch_trigger = 0;
         self.esc_buf.clear();
+        self.cursor_exp_sent = None;
+        self.last_quick_confirmation = None;
     }
 
     /// mosh-go `SetCursor` — only tracks server cursor when inactive.
@@ -511,6 +587,20 @@ impl Predictor {
     fn sort_pending(&mut self) {
         self.pending.sort_by(|a, b| (a.y, a.x).cmp(&(b.y, b.x)));
     }
+
+    fn make_pred(&self, ch: char, x: usize, y: usize, original_ch: char, unknown: bool) -> Prediction {
+        Prediction {
+            ch,
+            x,
+            y,
+            epoch: self.prediction_epoch,
+            at: Instant::now(),
+            expiration_sent: self.local_frame_sent.saturating_add(1),
+            original_ch,
+            unknown,
+        }
+    }
+
 
     /// mosh-go ExpireStale + stock glitch sampling on oldest pending age.
     pub fn expire_stale(&mut self, now: Instant) {
@@ -603,8 +693,9 @@ impl Predictor {
             let pred_y = pred.y;
             let pred_ch = pred.ch;
             let pred_at = pred.at;
-            let pred_exp = pred.expiration_sent;
-            let _ = pred_exp;
+            let pred_original = pred.original_ch;
+            let pred_unknown = pred.unknown;
+            let _ = pred.expiration_sent;
 
             let Some(cell) = fb.cell_at(pred_x, pred_y) else {
                 if confirmed > 0 {
@@ -626,11 +717,17 @@ impl Predictor {
                 if Instant::now().saturating_duration_since(pred_at) < GLITCH_THRESHOLD {
                     quick = true;
                 }
-                // Stock CorrectNoCredit: blank/space matches do not prove a band.
-                let no_credit = pred_ch == ' ' || is_default_blank(cell);
+                // Stock CorrectNoCredit: no-op / blank / unknown do not prove a band.
+                let no_credit = pred_unknown
+                    || pred_ch == ' '
+                    || is_default_blank(cell)
+                    || pred_ch == pred_original;
                 if !no_credit && pred_epoch > self.confirmed_epoch {
                     self.confirmed_epoch = pred_epoch;
                 }
+                confirmed += 1;
+            } else if pred_unknown {
+                // Stock unknown → CorrectNoCredit: drop without diverge.
                 confirmed += 1;
             } else if (cell.ch == ' ' || cell.ch == '\0') && pred_ch != ' ' {
                 break;
@@ -653,15 +750,44 @@ impl Predictor {
             self.pending.drain(..confirmed);
             self.confirmed = self.confirmed.saturating_add(confirmed);
             if quick && self.glitch_trigger > 0 {
-                self.glitch_trigger -= 1;
+                let now = Instant::now();
+                let ok = self
+                    .last_quick_confirmation
+                    .map(|t| now.saturating_duration_since(t) >= GLITCH_REPAIR_MININTERVAL)
+                    .unwrap_or(true);
+                if ok {
+                    self.glitch_trigger -= 1;
+                    self.last_quick_confirmation = Some(now);
+                }
             }
         }
 
         if self.pending.is_empty() {
-            self.active = false;
             self.glitch_trigger = 0;
-            self.cur_x = fb.cur_x;
-            self.cur_y = fb.cur_y;
+            // Cursor-only: if expired and host disagrees, reset; if matches, clear active.
+            if let Some(exp) = self.cursor_exp_sent {
+                if self.local_frame_sent == 0 || self.local_frame_acked >= exp {
+                    if fb.cur_x == self.cur_x && fb.cur_y == self.cur_y {
+                        self.active = false;
+                        self.cursor_exp_sent = None;
+                        self.cur_x = fb.cur_x;
+                        self.cur_y = fb.cur_y;
+                    } else if self.local_frame_sent > 0 {
+                        // Host cursor disagrees after ack — stock IncorrectOrExpired.
+                        self.reset();
+                        self.cur_x = fb.cur_x;
+                        self.cur_y = fb.cur_y;
+                    } else {
+                        self.active = false;
+                        self.cur_x = fb.cur_x;
+                        self.cur_y = fb.cur_y;
+                    }
+                }
+            } else {
+                self.active = false;
+                self.cur_x = fb.cur_x;
+                self.cur_y = fb.cur_y;
+            }
         }
     }
 

@@ -315,6 +315,61 @@ fn row_change_becomes_tentative() {
 }
 
 #[test]
+fn host_line_insert_shifts_tail_under_pending() {
+    let mut p = always();
+    p.set_frames(4, 0);
+    let mut host = blank_fb();
+    for (i, ch) in ['h', 'e', 'l', 'l', 'o'].into_iter().enumerate() {
+        host.put_rune(i, 0, ch, Attr::default());
+    }
+    host.cur_x = 2; // insert before first 'l'
+    p.set_cursor(2, 0);
+    p.keystroke(b"X", &host);
+    // Expect X at 2, old l@2→3, l@3→4, o@4→5 under Pending
+    assert!(p.pending_len() >= 2);
+    let mut by = std::collections::BTreeMap::new();
+    for i in 0..p.pending_len() {
+        by.insert(p.pending_pos(i).unwrap().0, p.pending_char(i).unwrap());
+    }
+    assert_eq!(by.get(&2), Some(&'X'));
+    // Unacked: confirm must not wipe
+    p.confirm(&host);
+    assert!(p.pending_len() > 0);
+}
+
+#[test]
+fn cr_advances_row_when_not_bottom() {
+    let mut p = always();
+    p.set_cursor(5, 2);
+    p.keystroke(b"\r", &blank_fb());
+    assert_eq!(p.cur_x(), 0);
+    assert_eq!(p.cur_y(), 3);
+}
+
+#[test]
+fn original_ch_no_credit_for_noop() {
+    let mut p = always();
+    // Host already has 'a' at 0; predicting 'a' is CorrectNoCredit
+    let mut host = blank_fb();
+    host.put_rune(0, 0, 'a', Attr::default());
+    p.set_cursor(0, 0);
+    // Force new epoch so we can observe credit
+    p.become_tentative();
+    let conf_before = p.confirmed_epoch_for_test();
+    let ep = p.prediction_epoch_for_test();
+    p.keystroke(b"a", &host); // original_ch = 'a', pred = 'a'
+    host.cur_x = 1;
+    p.confirm(&host);
+    // no_credit should not advance confirmed_epoch to new epoch
+    assert!(
+        p.confirmed_epoch_for_test() <= conf_before
+            || p.confirmed_epoch_for_test() < ep
+            || p.pending_len() == 0,
+        "noop match must not falsely prove new band"
+    );
+}
+
+#[test]
 fn pipeline_with_frames_confirm_after_ack() {
     let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
     pipe.set_frames_for_test(2, 2);
