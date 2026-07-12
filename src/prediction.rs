@@ -417,28 +417,41 @@ impl Predictor {
             self.active = true;
             return;
         }
-        // Host-row insert BS: predict shifted host tail (stock for-loop).
-        // Keep non-row pending from `next` (other rows).
+        // Host-row insert BS: predict shifted host tail until last non-blank
+        // (stock shifts whole row; we stop at trailing blanks to avoid O(cols)
+        // space preds that stall Confirm forever).
         self.pending = next;
         let exp = self.local_frame_sent.saturating_add(1);
         let ep = self.prediction_epoch;
         let now = Instant::now();
-        for x in cx..fb.cols.saturating_sub(1) {
-            let src = fb.cell_at(x + 1, cy);
-            let ch = src.map(|c| if c.ch == '\0' { ' ' } else { c.ch }).unwrap_or(' ');
-            self.pending.push(Prediction {
-                ch,
-                x,
-                y: cy,
-                epoch: ep,
-                at: now,
-                expiration_sent: exp,
-            });
+        let mut last_content = cx;
+        for x in (cx..fb.cols).rev() {
+            if let Some(c) = fb.cell_at(x, cy) {
+                if c.ch != ' ' && c.ch != '\0' {
+                    last_content = x;
+                    break;
+                }
+            }
         }
-        if fb.cols > 0 {
+        // Shift content from cx..last_content; write space at the old last content cell.
+        if last_content >= cx {
+            for x in cx..last_content {
+                let src = fb.cell_at(x + 1, cy);
+                let ch = src
+                    .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                    .unwrap_or(' ');
+                self.pending.push(Prediction {
+                    ch,
+                    x,
+                    y: cy,
+                    epoch: ep,
+                    at: now,
+                    expiration_sent: exp,
+                });
+            }
             self.pending.push(Prediction {
                 ch: ' ',
-                x: fb.cols - 1,
+                x: last_content,
                 y: cy,
                 epoch: ep,
                 at: now,
@@ -504,12 +517,12 @@ impl Predictor {
 
         let cutoff = now.checked_sub(PREDICTION_TIMEOUT).unwrap_or(now);
         let mut changed = false;
-        while self
-            .pending
-            .first()
-            .map(|p| p.at < cutoff)
-            .unwrap_or(false)
-        {
+        while self.pending.first().map(|p| p.at < cutoff).unwrap_or(false) {
+            let front = &self.pending[0];
+            // Do not wall-clock-drop preds still in frame Pending (awaiting ack).
+            if self.local_frame_sent > 0 && self.local_frame_acked < front.expiration_sent {
+                break;
+            }
             self.pending.remove(0);
             changed = true;
         }
@@ -538,6 +551,16 @@ impl Predictor {
         !self.esc_buf.is_empty()
     }
 
+    #[cfg(test)]
+    pub fn prediction_epoch_for_test(&self) -> u64 {
+        self.prediction_epoch
+    }
+
+    #[cfg(test)]
+    pub fn confirmed_epoch_for_test(&self) -> u64 {
+        self.confirmed_epoch
+    }
+
     /// Confirm against host FB with stock Pending (frame-ack) semantics.
     pub fn confirm(&mut self, fb: &Framebuffer) {
         if self.pending.is_empty() {
@@ -563,10 +586,20 @@ impl Predictor {
             if self.local_frame_sent > 0 && self.local_frame_acked < pred.expiration_sent {
                 break;
             }
-            let Some(cell) = fb.cell_at(pred.x, pred.y) else {
-                if pred.epoch > self.confirmed_epoch {
-                    let ep = pred.epoch;
-                    self.kill_epoch(ep);
+            let pred_epoch = pred.epoch;
+            let pred_x = pred.x;
+            let pred_y = pred.y;
+            let pred_ch = pred.ch;
+            let pred_at = pred.at;
+            let pred_exp = pred.expiration_sent;
+            let _ = pred_exp;
+
+            let Some(cell) = fb.cell_at(pred_x, pred_y) else {
+                if confirmed > 0 {
+                    self.pending.drain(..confirmed);
+                }
+                if pred_epoch > self.confirmed_epoch {
+                    self.kill_epoch(pred_epoch);
                 } else {
                     self.reset();
                     self.cur_x = fb.cur_x;
@@ -574,23 +607,26 @@ impl Predictor {
                 }
                 return;
             };
-            if cell.ch == pred.ch {
-                if pred.ch == ' ' && is_default_blank(cell) && fb.cur_x <= pred.x {
+            if cell.ch == pred_ch {
+                if pred_ch == ' ' && is_default_blank(cell) && fb.cur_x <= pred_x {
                     break;
                 }
-                if Instant::now().saturating_duration_since(pred.at) < GLITCH_THRESHOLD {
+                if Instant::now().saturating_duration_since(pred_at) < GLITCH_THRESHOLD {
                     quick = true;
                 }
                 // Advance confidence band (stock confirmed_epoch).
-                if pred.epoch > self.confirmed_epoch {
-                    self.confirmed_epoch = pred.epoch;
+                if pred_epoch > self.confirmed_epoch {
+                    self.confirmed_epoch = pred_epoch;
                 }
                 confirmed += 1;
-            } else if (cell.ch == ' ' || cell.ch == '\0') && pred.ch != ' ' {
+            } else if (cell.ch == ' ' || cell.ch == '\0') && pred_ch != ' ' {
                 break;
-            } else if pred.epoch > self.confirmed_epoch {
-                let ep = pred.epoch;
-                self.kill_epoch(ep);
+            } else if pred_epoch > self.confirmed_epoch {
+                // Drain already-matched prefix, then kill failed tentative epoch.
+                if confirmed > 0 {
+                    self.pending.drain(..confirmed);
+                }
+                self.kill_epoch(pred_epoch);
                 return;
             } else {
                 self.reset();

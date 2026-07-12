@@ -223,20 +223,68 @@ fn host_row_bs_uses_frame_pending_not_instant_diverge() {
     host.cur_x = 1;
     p.keystroke(&[0x7f], &host);
     assert_eq!(p.cur_x(), 0);
-    assert!(p.pending_len() > 0, "host-row BS creates shift preds");
+    let n = p.pending_len();
+    assert!(n > 0 && n <= 6, "shift preds bounded, got {n}");
     // Host not yet updated — still Pending, no diverge
     p.confirm(&host);
-    assert!(p.pending_len() > 0, "must stay Pending until frame acked");
-    // Ack frames and apply shifted host, then confirm can succeed
+    assert_eq!(p.pending_len(), n, "must stay Pending until frame acked");
+    // Ack frames and apply shifted host
     p.set_frames(5, 6);
     let mut shifted = blank_fb();
     for (i, ch) in ['e', 'l', 'l', 'o', ' '].into_iter().enumerate() {
         shifted.put_rune(i, 0, ch, Attr::default());
     }
-    shifted.cur_x = 0;
+    shifted.cur_x = 5; // past spaces so space preds can confirm
     p.confirm(&shifted);
-    // Should make progress without panic
-    assert!(p.cur_x() <= shifted.cols);
+    assert_eq!(
+        p.pending_len(),
+        0,
+        "after ack + shifted host, pending must drain"
+    );
+}
+
+#[test]
+fn kill_epoch_drains_matched_prefix() {
+    let mut p = always();
+    p.set_cursor(0, 0);
+    p.keystroke(b"ab", &blank_fb());
+    // Prove epoch so confirmed_epoch advances
+    let mut fb = blank_fb();
+    fb.put_rune(0, 0, 'a', Attr::default());
+    fb.put_rune(1, 0, 'b', Attr::default());
+    fb.cur_x = 2;
+    p.confirm(&fb);
+    assert_eq!(p.confirmed_epoch_for_test(), p.prediction_epoch_for_test());
+    // New band after tentative
+    p.become_tentative();
+    let ep_new = p.prediction_epoch_for_test();
+    assert!(ep_new > p.confirmed_epoch_for_test());
+    p.keystroke(b"xy", &blank_fb());
+    // Confirm only first of new band, second diverges → kill_epoch
+    let mut fb2 = blank_fb();
+    fb2.put_rune(2, 0, 'x', Attr::default());
+    fb2.put_rune(3, 0, 'Z', Attr::default()); // diverge on y
+    fb2.cur_x = 4;
+    p.confirm(&fb2);
+    // Matched x drained; y epoch killed — no leftover matched prefix
+    assert_eq!(p.pending_len(), 0);
+}
+
+#[test]
+fn pipeline_with_frames_confirm_after_ack() {
+    let mut pipe = DisplayPipeline::new(80, 24, DisplayPreference::Always);
+    pipe.set_frames_for_test(2, 2);
+    let _ = pipe.on_host_bytes(b"\x1b[H");
+    pipe.set_frames_for_test(2, 2);
+    let _ = pipe.on_keystroke(b"z");
+    // Keystroke may stamp exp=sent+1; simulate next loop frames
+    pipe.set_frames_for_test(3, 2); // not yet acked if exp=3
+    let _ = pipe.on_host_bytes(b"\x1b[1;1Hz");
+    // Still may be pending if exp > acked
+    pipe.set_frames_for_test(3, 4);
+    let _ = pipe.on_host_bytes(b"\x1b[1;1Hz");
+    assert_eq!(pipe.predictor().pending_len(), 0);
+    assert_eq!(pipe.last_shown().unwrap().cell_at(0, 0).unwrap().ch, 'z');
 }
 
 #[test]
