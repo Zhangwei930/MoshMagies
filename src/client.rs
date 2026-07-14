@@ -137,8 +137,19 @@ impl Client {
         loop {
             match self.socket.recv(&mut buf) {
                 Ok(n) => {
-                    if let Some(diff) = self.transport.recv(&buf[..n]) {
-                        let chunk = self.terminal.apply_host_diff(&diff);
+                    if let Some(state) = self.transport.recv_state(&buf[..n]) {
+                        let chunk = match self.terminal.apply_host_state(
+                            state.old_num,
+                            state.new_num,
+                            state.throwaway_num,
+                            &state.diff,
+                        ) {
+                            Ok(chunk) => chunk,
+                            Err(error) => {
+                                self.mark_dead("remote terminal state was rejected");
+                                return Err(error);
+                            }
+                        };
                         paint.extend_from_slice(&chunk);
                     }
                 }
@@ -190,6 +201,15 @@ impl Client {
 
     pub fn terminal(&self) -> &TerminalView {
         &self.terminal
+    }
+
+    /// Latest complete server framebuffer and its SSP state number.
+    pub fn remote_framebuffer(&self) -> &crate::framebuffer::Framebuffer {
+        self.terminal.remote_framebuffer()
+    }
+
+    pub fn remote_state_num(&self) -> u64 {
+        self.terminal.remote_state_num()
     }
 
     fn mark_dead(&mut self, reason: &str) {
@@ -336,6 +356,52 @@ mod tests {
         (port, key_b64, handle)
     }
 
+    fn spawn_parallel_state_server() -> (u16, String, thread::JoinHandle<()>) {
+        let mut key = [0u8; 16];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13).wrapping_add(5);
+        }
+        let key_b64 = {
+            use base64::Engine;
+            let s = base64::engine::general_purpose::STANDARD.encode(key);
+            s.trim_end_matches('=').to_string()
+        };
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = sock.local_addr().unwrap().port();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        let handle = thread::spawn(move || {
+            let ocb = Ocb::new(&key).unwrap();
+            let mut transport = Transport::new_server(ocb);
+            let mut buf = [0u8; 4096];
+            let (n, client_addr) = sock.recv_from(&mut buf).expect("client hello");
+            let _ = transport.recv(&buf[..n]);
+
+            // Before the client's ACK can return, the server emits two newer
+            // states from the same state 0 base. Each branch legitimately
+            // contains the same `h`; applying both diffs to the live screen
+            // would display `hh` even though the server state contains one h.
+            let branch = HostInstruction::encode_message(&[HostInstruction {
+                hoststring: b"h".to_vec(),
+                width: 0,
+                height: 0,
+                echo_ack_num: -1,
+            }]);
+            transport.set_pending(branch.clone());
+            for datagram in transport.tick() {
+                sock.send_to(&datagram, client_addr).unwrap();
+            }
+            transport.set_pending(branch);
+            for datagram in transport.tick() {
+                sock.send_to(&datagram, client_addr).unwrap();
+            }
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        (port, key_b64, handle)
+    }
+
     #[test]
     fn client_dial_recv_and_command_against_fake_server() {
         let marker = "NETCATTY_MOSH_UNIT_OK";
@@ -367,5 +433,28 @@ mod tests {
         }
         let _ = handle.join();
         panic!("marker not found in output: {all:?}");
+    }
+
+    #[test]
+    fn parallel_remote_states_render_shared_content_once() {
+        let (port, key, handle) = spawn_parallel_state_server();
+        let mut client = Client::dial("127.0.0.1", port, &key).expect("dial");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            output.extend_from_slice(&client.poll().unwrap());
+            if !output.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap();
+
+        let plain = crate::terminal::strip_ansi(&String::from_utf8_lossy(&output));
+        assert_eq!(
+            plain.chars().filter(|&ch| ch == 'h').count(),
+            1,
+            "parallel SSP branches must be reconstructed as states, not replayed as raw diffs: {plain:?}",
+        );
     }
 }

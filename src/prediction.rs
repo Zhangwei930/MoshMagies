@@ -18,6 +18,8 @@
 
 use std::time::{Duration, Instant};
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::framebuffer::Framebuffer;
 
 /// Stock adaptive hysteresis (terminaloverlay.h):
@@ -1117,7 +1119,7 @@ impl Predictor {
                 && cell.width == 1
                 && attr_eq_ignoring_under(&cell.attr, &rep_attr);
             if !same {
-                cell.ch = pred.ch;
+                cell.replace_char(pred.ch);
                 cell.width = 1;
                 cell.attr = rep_attr;
                 if flag {
@@ -1160,37 +1162,9 @@ impl Predictor {
     }
 }
 
-/// Approximate terminal width: 0 combining/ZW, 1 normal, 2 CJK/wide.
+/// Unicode terminal width used to decide whether a glyph is safe to predict.
 fn unicode_width_approx(ch: char) -> i8 {
-    let c = ch as u32;
-    // Zero-width / combining (stock wcwidth != 1 → tentative).
-    if (0x0300..=0x036F).contains(&c)
-        || (0x1AB0..=0x1AFF).contains(&c)
-        || (0x1DC0..=0x1DFF).contains(&c)
-        || (0x20D0..=0x20FF).contains(&c)
-        || (0xFE20..=0xFE2F).contains(&c)
-        || matches!(c, 0x200B | 0x200C | 0x200D | 0x2060 | 0xFEFF)
-    {
-        return 0;
-    }
-    if c < 0x1100 {
-        return 1;
-    }
-    // Common wide ranges (simplified; good enough for tentative vs predict)
-    if (0x1100..=0x115F).contains(&c)
-        || (0x2E80..=0xA4CF).contains(&c)
-        || (0xAC00..=0xD7A3).contains(&c)
-        || (0xF900..=0xFAFF).contains(&c)
-        || (0xFE10..=0xFE6F).contains(&c)
-        || (0xFF00..=0xFF60).contains(&c)
-        || (0xFFE0..=0xFFE6).contains(&c)
-        || (0x20000..=0x2FFFD).contains(&c)
-        || (0x30000..=0x3FFFD).contains(&c)
-    {
-        2
-    } else {
-        1
-    }
+    UnicodeWidthChar::width(ch).unwrap_or(0) as i8
 }
 
 enum ArrowParse {
@@ -1479,6 +1453,33 @@ impl DisplayPipeline {
             }
             self.last_shown = Some(self.host_fb.clone());
             return hoststring.to_vec();
+        }
+
+        self.using_overlay_path = true;
+        self.render_overlay_path()
+    }
+
+    /// Replace the host model with a complete reconstructed SSP state.
+    ///
+    /// Live clients use this path so parallel server branches are resolved
+    /// before prediction. It also preserves the state's unique scroll marker,
+    /// which prevents pending glyphs from surviving on the wrong row.
+    pub fn on_host_frame(&mut self, frame: &Framebuffer) -> Vec<u8> {
+        let geometry = self.host_fb.cols != frame.cols
+            || self.host_fb.rows != frame.rows
+            || self.host_fb.scroll_generation != frame.scroll_generation;
+        self.host_fb = frame.clone();
+        if geometry {
+            self.predictor.reset();
+        }
+        self.predictor
+            .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
+        self.predictor.confirm(&self.host_fb);
+        self.predictor.expire_stale(Instant::now());
+
+        if !self.predictor.should_show() {
+            self.using_overlay_path = false;
+            return self.render_host_only();
         }
 
         self.using_overlay_path = true;

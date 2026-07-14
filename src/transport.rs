@@ -33,6 +33,19 @@ const TS_NO_REPLY: u16 = 0xFFFF;
 /// Sliding window of recently seen crypto sequence numbers (true replay filter).
 const SEEN_SEQ_CAP: usize = 512;
 
+/// Maximum number of complete remote states retained while the peer keeps
+/// referencing an old base. Once full, reject newer branches until the peer's
+/// throwaway watermark makes room; never ACK a state whose base was discarded.
+pub(crate) const RECEIVED_STATE_CAP: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceivedStateDiff {
+    pub old_num: u64,
+    pub new_num: u64,
+    pub throwaway_num: u64,
+    pub diff: Vec<u8>,
+}
+
 /// High-level transport that wraps OCB, fragments, and SSP counters.
 pub struct Transport {
     ocb: Ocb,
@@ -54,8 +67,6 @@ pub struct Transport {
     ack_num: u64,
     sent_ack_num: u64,
     throwaway_num: u64,
-    last_recv_old_num: u64,
-    last_recv_new_num: u64,
 
     seq_out: u64,
     /// Expected next crypto seq (for RTT bookkeeping only; reorder still accepted).
@@ -111,8 +122,6 @@ impl Transport {
             ack_num: 0,
             sent_ack_num: 0,
             throwaway_num: 0,
-            last_recv_old_num: 0,
-            last_recv_new_num: 0,
             seq_out: 0,
             expected_receiver_seq: 0,
             expected_receiver_seq_set: false,
@@ -237,8 +246,14 @@ impl Transport {
     }
 
     /// Process an incoming wire datagram. Returns the raw diff payload if a
-    /// complete new state was applied, or `None`.
+    /// complete new state was accepted, or `None`.
     pub fn recv(&mut self, wire: &[u8]) -> Option<Vec<u8>> {
+        self.recv_state(wire).map(|state| state.diff)
+    }
+
+    /// Process a datagram and retain the SSP numbering needed to reconstruct
+    /// the peer's complete remote state.
+    pub(crate) fn recv_state(&mut self, wire: &[u8]) -> Option<ReceivedStateDiff> {
         if wire.len() < MIN_DATAGRAM {
             return None;
         }
@@ -312,14 +327,8 @@ impl Transport {
             }
         }
 
-        // Always apply peer throwaway (including retransmits / keepalives).
-        // Upstream processes throwaway even when new_num is a duplicate.
-        if ti.throwaway_num > self.throwaway_num {
-            self.throwaway_num = ti.throwaway_num;
-            self.received_nums.retain(|&n| n >= self.throwaway_num);
-        }
-
-        // Dedup new_num (after throwaway so retransmits still prune).
+        // Stock mosh validates idempotency against the pre-pruned state queue:
+        // dedup new_num, require old_num, clone the base, then honor throwaway.
         if self.received_nums.contains(&ti.new_num) {
             return None;
         }
@@ -328,26 +337,20 @@ impl Transport {
             return None;
         }
 
-        self.last_recv_old_num = ti.old_num;
-        self.last_recv_new_num = ti.new_num;
-        self.received_nums.push(ti.new_num);
-        // Cap while preserving 0 and throwaway floor.
-        if self.received_nums.len() > 256 {
-            let floor = self.throwaway_num;
-            self.received_nums.retain(|&n| n == 0 || n >= floor);
-            if self.received_nums.len() > 256 {
-                // Drop oldest non-zero entries but keep 0.
-                let mut rest: Vec<u64> = self
-                    .received_nums
-                    .iter()
-                    .copied()
-                    .filter(|&n| n != 0)
-                    .collect();
-                rest.sort_unstable();
-                let keep = rest.split_off(rest.len().saturating_sub(255));
-                self.received_nums = std::iter::once(0).chain(keep).collect();
-            }
+        if ti.throwaway_num > self.throwaway_num {
+            self.throwaway_num = ti.throwaway_num;
+            self.received_nums.retain(|&n| n >= self.throwaway_num);
         }
+
+        // Match stock mosh's safety rule: do not drop an already accepted
+        // middle state merely to make space. Reject the new state until the
+        // sender advances throwaway_num, so transport and terminal snapshots
+        // always retain the same bases.
+        if self.received_nums.len() >= RECEIVED_STATE_CAP {
+            return None;
+        }
+
+        self.received_nums.push(ti.new_num);
 
         // Only advance ack_num forward (upstream tracks sorted list + back).
         if ti.new_num > self.ack_num {
@@ -356,7 +359,12 @@ impl Transport {
         if !ti.diff.is_empty() {
             self.pending_data_ack = true;
         }
-        Some(ti.diff)
+        Some(ReceivedStateDiff {
+            old_num: ti.old_num,
+            new_num: ti.new_num,
+            throwaway_num: self.throwaway_num,
+            diff: ti.diff,
+        })
     }
 
     fn remember_seq(&mut self, seq: u64) {
@@ -660,6 +668,41 @@ mod tests {
             let _ = client.recv(&dg);
         }
         assert_eq!(client.ack_num(), 2);
+    }
+
+    #[test]
+    fn remote_state_queue_rejects_new_branches_until_throwaway_frees_space() {
+        let (mut server, mut client) = pair();
+        let mut accepted = 0usize;
+        for state in 1..=(RECEIVED_STATE_CAP + 4) {
+            server.set_pending(vec![(state & 0xff) as u8]);
+            for datagram in server.tick() {
+                if client.recv_state(&datagram).is_some() {
+                    accepted += 1;
+                }
+            }
+        }
+        assert_eq!(accepted, RECEIVED_STATE_CAP - 1);
+        assert_eq!(client.received_nums.len(), RECEIVED_STATE_CAP);
+        assert!(client.received_nums.contains(&0));
+        assert_eq!(client.ack_num(), (RECEIVED_STATE_CAP - 1) as u64);
+
+        // Let the sender learn the highest accepted state. Its next branch may
+        // still reference state 0 in this packet, so the receiver must clone
+        // that base before applying the new throwaway watermark.
+        client.force_next_send();
+        for datagram in client.tick() {
+            let _ = server.recv(&datagram);
+        }
+        server.set_pending(b"after-prune".to_vec());
+        let recovered = server
+            .tick()
+            .into_iter()
+            .find_map(|datagram| client.recv_state(&datagram));
+        let recovered = recovered.expect("throwaway should make queue space");
+        assert!(recovered.throwaway_num > 0);
+        assert!(client.received_nums.len() < RECEIVED_STATE_CAP);
+        assert!(!client.received_nums.contains(&0));
     }
 
     #[test]

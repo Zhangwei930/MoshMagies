@@ -2157,6 +2157,29 @@ fn host_wrap_scroll_resets_pending() {
     );
 }
 
+#[test]
+fn reconstructed_host_frame_scroll_resets_pending() {
+    let mut pipe = DisplayPipeline::new(4, 3, DisplayPreference::Always);
+    pipe.prove_band_for_test();
+    let mut host = Framebuffer::new(4, 3);
+    host.cur_x = 0;
+    host.cur_y = 2;
+    let _ = pipe.on_host_frame(&host);
+    pipe.predictor_mut_for_test().set_overwrite_for_test(true);
+    let _ = pipe.on_keystroke(b"z");
+    assert!(pipe.predictor().pending_len() > 0);
+
+    let mut scrolled = host.clone();
+    crate::ansi_apply::apply_ansi(&mut scrolled, b"\n");
+    assert_ne!(scrolled.scroll_generation, host.scroll_generation);
+    let _ = pipe.on_host_frame(&scrolled);
+    assert_eq!(
+        pipe.predictor().pending_len(),
+        0,
+        "a reconstructed server scroll must invalidate old prediction rows"
+    );
+}
+
 
 #[test]
 fn last_col_insert_collates_prior_unknown() {

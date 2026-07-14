@@ -1,6 +1,6 @@
 [package]
 name = "moshcatty"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.75"
 description = "MoshCatty — pure Rust Mosh client, wire-compatible with stock mosh-server"
@@ -30,6 +30,7 @@ base64 = "0.22"
 flate2 = "1"
 thiserror = "2"
 libc = "0.2"
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 hex = "0.4"

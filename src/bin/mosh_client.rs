@@ -103,6 +103,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_resize_check = Instant::now();
     let mut cur_cols = cols;
     let mut cur_rows = rows;
+    let mut last_remote_state_num = 0;
 
     while running.load(Ordering::SeqCst) {
         if client.is_dead() {
@@ -121,9 +122,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Poll first so host_fb is updated before late_ack Confirm.
         // Same-batch hoststring + echo_ack must not confirm against a stale FB
         // (that IncorrectOrExpires blank preds and permanently hides local echo).
-        let host_paint = client.poll()?;
-        if !host_paint.is_empty() {
-            let out = display.on_host_bytes(&host_paint);
+        let _host_paint = client.poll()?;
+        if client.remote_state_num() != last_remote_state_num {
+            last_remote_state_num = client.remote_state_num();
+            let out = display.on_host_frame(client.remote_framebuffer());
             if !out.is_empty() {
                 stdout.write_all(&out)?;
                 stdout.flush()?;
@@ -160,12 +162,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // EOF: drain remaining paint briefly then exit (PTY closed).
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while Instant::now() < deadline && !client.is_dead() {
-                    let host_paint = client.poll()?;
-                    if host_paint.is_empty() {
+                    let _host_paint = client.poll()?;
+                    if client.remote_state_num() == last_remote_state_num {
                         thread::sleep(Duration::from_millis(10));
                         continue;
                     }
-                    let out = display.on_host_bytes(&host_paint);
+                    last_remote_state_num = client.remote_state_num();
+                    let out = display.on_host_frame(client.remote_framebuffer());
                     if !out.is_empty() {
                         stdout.write_all(&out)?;
                         stdout.flush()?;
@@ -232,7 +235,7 @@ const DISPLAY_OPEN: &[u8] = b"\x1b[?1049h\x1b[?1h";
 /// Stock mosh `Display::close()`: leave app-cursor / reset SGR / show cursor /
 /// disable common mouse modes / leave alternate screen (rmcup).
 const DISPLAY_CLOSE: &[u8] = b"\x1b[?1l\x1b[0m\x1b[?25h\
-\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\
+\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l\
 \x1b[?1015l\x1b[?1006l\x1b[?1005l\
 \x1b[?1049l";
 

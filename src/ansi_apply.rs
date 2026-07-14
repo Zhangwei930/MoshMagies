@@ -3,7 +3,7 @@
 //! Enough of the VT stream for prediction confirm: CUP, SGR, printable text,
 //! CR/LF, erase-in-line/display, cursor show/hide. OSC is skipped.
 
-use crate::framebuffer::{Attr, Color, ColorType, Framebuffer};
+use crate::framebuffer::{Attr, Cell, Color, ColorType, Framebuffer};
 
 /// Sticky SGR pen + incomplete-sequence carry across HostBytes chunks.
 #[derive(Debug, Clone, Default)]
@@ -47,18 +47,23 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
         if b == b'\r' {
             fb.cur_x = 0;
             fb.next_print_will_wrap = false;
+            fb.retarget_combining_to_cursor();
             i += 1;
             continue;
         }
         if b == b'\n' {
-            // Scroll when at bottom (stock Display often uses CR+LF scroll).
-            if fb.cur_y + 1 >= fb.rows {
-                scroll_up(fb, 1);
-                fb.cur_y = fb.rows.saturating_sub(1);
+            // DECSTBM: linefeed scrolls only the active margin when the cursor
+            // is on its bottom row. Stock mosh uses this for partial-screen
+            // scrolls in full-screen applications.
+            if fb.cur_y == fb.scroll_bottom {
+                let blank = erased_cell(pen);
+                scroll_up_region(fb, fb.scroll_top, fb.scroll_bottom, 1, &blank);
+                fb.cur_y = fb.scroll_bottom;
             } else {
-                fb.cur_y += 1;
+                fb.cur_y = (fb.cur_y + 1).min(fb.rows.saturating_sub(1));
             }
             fb.next_print_will_wrap = false;
+            fb.retarget_combining_to_cursor();
             i += 1;
             continue;
         }
@@ -67,11 +72,13 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
             if fb.cur_x > 0 {
                 fb.cur_x -= 1;
             }
+            fb.next_print_will_wrap = false;
+            fb.retarget_combining_to_cursor();
             i += 1;
             continue;
         }
         if b == 0x07 {
-            // BEL
+            fb.bell_count = fb.bell_count.wrapping_add(1);
             i += 1;
             continue;
         }
@@ -90,22 +97,25 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
                 if ch == '\0' {
                     continue;
                 }
+                if fb.try_extend_active_grapheme(ch) {
+                    continue;
+                }
                 // Stock next_print_will_wrap: wrap *before* placing the next glyph.
                 if fb.next_print_will_wrap {
                     fb.next_print_will_wrap = false;
-                    if fb.cur_y + 1 < fb.rows {
-                        fb.cur_y += 1;
-                        fb.cur_x = 0;
+                    if fb.cur_y == fb.scroll_bottom {
+                        let blank = erased_cell(pen);
+                        scroll_up_region(fb, fb.scroll_top, fb.scroll_bottom, 1, &blank);
+                        fb.cur_y = fb.scroll_bottom;
                     } else {
-                        scroll_up(fb, 1);
-                        fb.cur_y = fb.rows.saturating_sub(1);
-                        fb.cur_x = 0;
+                        fb.cur_y = (fb.cur_y + 1).min(fb.rows.saturating_sub(1));
                     }
+                    fb.cur_x = 0;
                 }
                 let x = fb.cur_x;
                 let y = fb.cur_y;
                 if x < fb.cols && y < fb.rows {
-                    let w = fb.put_rune(x, y, ch, pen.attr);
+                    let w = fb.put_rune_with_hyperlink(x, y, ch, pen.attr, fb.active_hyperlink);
                     if w == 0 {
                         // Combining / ZW: do not advance cursor.
                         continue;
@@ -124,25 +134,21 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
     }
 }
 
-fn scroll_up(fb: &mut Framebuffer, lines: usize) {
-    let lines = lines.min(fb.rows);
+fn scroll_up_region(fb: &mut Framebuffer, top: usize, bottom: usize, lines: usize, blank: &Cell) {
+    if top >= fb.rows || bottom >= fb.rows || top > bottom {
+        return;
+    }
+    let height = bottom - top + 1;
+    let lines = lines.min(height);
     if lines == 0 {
         return;
     }
-    let cols = fb.cols;
-    let rows = fb.rows;
     fb.scroll_generation = fb.scroll_generation.wrapping_add(1);
-    if lines >= rows {
-        for c in fb.cells.iter_mut() {
-            *c = Default::default();
-        }
-        return;
-    }
-    fb.cells.rotate_left(lines * cols);
-    let start = (rows - lines) * cols;
-    for c in &mut fb.cells[start..] {
-        *c = Default::default();
-    }
+    fb.scroll_rows_up(top, bottom, lines, blank);
+}
+
+fn erased_cell(pen: &AnsiPen) -> Cell {
+    Cell::erased(pen.attr.bg)
 }
 
 enum Utf8Decode {
@@ -215,9 +221,11 @@ fn consume_escape(
             i += 1;
             while i < data.len() {
                 if data[i] == 0x07 {
+                    apply_osc(fb, &data[start + 2..i]);
                     return EscapeConsume::Done(i + 1);
                 }
                 if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'\\' {
+                    apply_osc(fb, &data[start + 2..i]);
                     return EscapeConsume::Done(i + 2);
                 }
                 i += 1;
@@ -274,55 +282,62 @@ fn apply_csi(fb: &mut Framebuffer, pen: &mut AnsiPen, params: &[u8], final_byte:
             fb.cur_y = (row - 1).min(fb.rows.saturating_sub(1));
             fb.cur_x = (col - 1).min(fb.cols.saturating_sub(1));
             fb.next_print_will_wrap = false;
+            fb.retarget_combining_to_cursor();
         }
         b'A' => {
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_y = fb.cur_y.saturating_sub(n);
             fb.next_print_will_wrap = false;
+            fb.retarget_combining_to_cursor();
         }
         b'B' => {
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_y = (fb.cur_y + n).min(fb.rows.saturating_sub(1));
             fb.next_print_will_wrap = false;
+            fb.retarget_combining_to_cursor();
         }
         b'C' => {
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_x = (fb.cur_x + n).min(fb.cols.saturating_sub(1));
             fb.next_print_will_wrap = false;
+            fb.retarget_combining_to_cursor();
         }
         b'D' => {
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_x = fb.cur_x.saturating_sub(n);
             fb.next_print_will_wrap = false;
+            fb.retarget_combining_to_cursor();
         }
         b'G' => {
             // CHA — column absolute 1-indexed
             let col = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_x = (col - 1).min(fb.cols.saturating_sub(1));
             fb.next_print_will_wrap = false;
+            fb.retarget_combining_to_cursor();
         }
         b'd' => {
             // VPA
             let row = nums.first().copied().unwrap_or(1).max(1) as usize;
             fb.cur_y = (row - 1).min(fb.rows.saturating_sub(1));
             fb.next_print_will_wrap = false;
+            fb.retarget_combining_to_cursor();
         }
         b'J' => {
             // ED
             let mode = nums.first().copied().unwrap_or(0);
             match mode {
                 2 | 3 => {
-                    for c in fb.cells.iter_mut() {
-                        *c = Default::default();
-                    }
+                    let blank = erased_cell(pen);
+                    fb.fill_all(&blank);
+                    fb.scroll_generation = fb.scroll_generation.wrapping_add(1);
                     // stock often homes separately
                 }
                 0 => {
                     // erase from cursor to end of screen
-                    erase_from_cursor(fb);
+                    erase_from_cursor(fb, &erased_cell(pen));
                 }
                 1 => {
-                    erase_to_cursor(fb);
+                    erase_to_cursor(fb, &erased_cell(pen));
                 }
                 _ => {}
             }
@@ -331,25 +346,26 @@ fn apply_csi(fb: &mut Framebuffer, pen: &mut AnsiPen, params: &[u8], final_byte:
             // EL
             let mode = nums.first().copied().unwrap_or(0);
             let y = fb.cur_y;
+            let blank = erased_cell(pen);
             match mode {
                 0 => {
                     for x in fb.cur_x..fb.cols {
                         if let Some(c) = fb.cell_at_mut(x, y) {
-                            *c = Default::default();
+                            *c = blank.clone();
                         }
                     }
                 }
                 1 => {
                     for x in 0..=fb.cur_x.min(fb.cols.saturating_sub(1)) {
                         if let Some(c) = fb.cell_at_mut(x, y) {
-                            *c = Default::default();
+                            *c = blank.clone();
                         }
                     }
                 }
                 2 => {
                     for x in 0..fb.cols {
                         if let Some(c) = fb.cell_at_mut(x, y) {
-                            *c = Default::default();
+                            *c = blank.clone();
                         }
                     }
                 }
@@ -360,48 +376,60 @@ fn apply_csi(fb: &mut Framebuffer, pen: &mut AnsiPen, params: &[u8], final_byte:
             // ECH
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
             let y = fb.cur_y;
+            let blank = erased_cell(pen);
             for x in fb.cur_x..(fb.cur_x + n).min(fb.cols) {
                 if let Some(c) = fb.cell_at_mut(x, y) {
-                    *c = Default::default();
+                    *c = blank.clone();
                 }
             }
         }
         b'@' => {
             // ICH — insert n blank cells at cursor
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
-            insert_chars(fb, n);
+            insert_chars(fb, n, &erased_cell(pen));
         }
         b'P' => {
             // DCH — delete n cells at cursor
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
-            delete_chars(fb, n);
+            delete_chars(fb, n, &erased_cell(pen));
         }
         b'L' => {
             // IL — insert n blank lines
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
-            insert_lines(fb, n);
+            insert_lines(fb, n, &erased_cell(pen));
         }
         b'M' => {
             // DL — delete n lines
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
-            delete_lines(fb, n);
+            delete_lines(fb, n, &erased_cell(pen));
         }
         b'm' => apply_sgr(pen, &nums),
+        b'r' if !private => {
+            let top = nums.first().copied().unwrap_or(1).max(1) as usize - 1;
+            let bottom = nums.get(1).copied().unwrap_or(fb.rows as u32).max(1) as usize - 1;
+            if top < bottom && bottom < fb.rows {
+                fb.scroll_top = top;
+                fb.scroll_bottom = bottom;
+            } else if nums.is_empty() {
+                fb.scroll_top = 0;
+                fb.scroll_bottom = fb.rows.saturating_sub(1);
+            }
+        }
         b'h' if private => {
-            if nums.contains(&25) {
-                fb.cursor_visible = true;
+            for mode in nums {
+                set_private_mode(fb, mode, true);
             }
         }
         b'l' if private => {
-            if nums.contains(&25) {
-                fb.cursor_visible = false;
+            for mode in nums {
+                set_private_mode(fb, mode, false);
             }
         }
         _ => {}
     }
 }
 
-fn insert_chars(fb: &mut Framebuffer, n: usize) {
+fn insert_chars(fb: &mut Framebuffer, n: usize, blank: &Cell) {
     let y = fb.cur_y;
     let x = fb.cur_x;
     if y >= fb.rows || x >= fb.cols || n == 0 {
@@ -410,18 +438,18 @@ fn insert_chars(fb: &mut Framebuffer, n: usize) {
     let n = n.min(fb.cols - x);
     // Shift right from end
     for col in (x..fb.cols - n).rev() {
-        if let (Some(src), Some(dst)) = (fb.cell_at(col, y).copied(), fb.cell_at_mut(col + n, y)) {
+        if let (Some(src), Some(dst)) = (fb.cell_at(col, y).cloned(), fb.cell_at_mut(col + n, y)) {
             *dst = src;
         }
     }
     for col in x..x + n {
         if let Some(c) = fb.cell_at_mut(col, y) {
-            *c = Default::default();
+            *c = blank.clone();
         }
     }
 }
 
-fn delete_chars(fb: &mut Framebuffer, n: usize) {
+fn delete_chars(fb: &mut Framebuffer, n: usize, blank: &Cell) {
     let y = fb.cur_y;
     let x = fb.cur_x;
     if y >= fb.rows || x >= fb.cols || n == 0 {
@@ -429,81 +457,100 @@ fn delete_chars(fb: &mut Framebuffer, n: usize) {
     }
     let n = n.min(fb.cols - x);
     for col in x..fb.cols - n {
-        if let (Some(src), Some(dst)) = (fb.cell_at(col + n, y).copied(), fb.cell_at_mut(col, y)) {
+        if let (Some(src), Some(dst)) = (fb.cell_at(col + n, y).cloned(), fb.cell_at_mut(col, y)) {
             *dst = src;
         }
     }
     for col in (fb.cols - n)..fb.cols {
         if let Some(c) = fb.cell_at_mut(col, y) {
-            *c = Default::default();
+            *c = blank.clone();
         }
     }
 }
 
-fn insert_lines(fb: &mut Framebuffer, n: usize) {
+fn insert_lines(fb: &mut Framebuffer, n: usize, blank: &Cell) {
     let y = fb.cur_y;
-    if y >= fb.rows || n == 0 {
+    if y < fb.scroll_top || y > fb.scroll_bottom || n == 0 {
         return;
     }
-    let n = n.min(fb.rows - y);
-    let cols = fb.cols;
-    // Shift rows down
-    for row in (y..fb.rows - n).rev() {
-        for col in 0..cols {
-            if let (Some(src), Some(dst)) =
-                (fb.cell_at(col, row).copied(), fb.cell_at_mut(col, row + n))
-            {
-                *dst = src;
-            }
-        }
-    }
-    for row in y..y + n {
-        for col in 0..cols {
-            if let Some(c) = fb.cell_at_mut(col, row) {
-                *c = Default::default();
-            }
-        }
-    }
+    let n = n.min(fb.scroll_bottom - y + 1);
+    fb.insert_blank_rows(y, fb.scroll_bottom, n, blank);
+    fb.scroll_generation = fb.scroll_generation.wrapping_add(1);
 }
 
-fn delete_lines(fb: &mut Framebuffer, n: usize) {
+fn delete_lines(fb: &mut Framebuffer, n: usize, blank: &Cell) {
     let y = fb.cur_y;
-    if y >= fb.rows || n == 0 {
+    if y < fb.scroll_top || y > fb.scroll_bottom || n == 0 {
         return;
     }
-    let n = n.min(fb.rows - y);
-    let cols = fb.cols;
-    for row in y..fb.rows - n {
-        for col in 0..cols {
-            if let (Some(src), Some(dst)) =
-                (fb.cell_at(col, row + n).copied(), fb.cell_at_mut(col, row))
-            {
-                *dst = src;
+    let n = n.min(fb.scroll_bottom - y + 1);
+    fb.delete_rows(y, fb.scroll_bottom, n, blank);
+    fb.scroll_generation = fb.scroll_generation.wrapping_add(1);
+}
+
+fn set_private_mode(fb: &mut Framebuffer, mode: u32, enabled: bool) {
+    match mode {
+        5 => fb.reverse_video = enabled,
+        25 => fb.cursor_visible = enabled,
+        2004 => fb.bracketed_paste = enabled,
+        9 | 1000..=1003 => {
+            if enabled {
+                fb.mouse_reporting_mode = mode as u16;
+            } else if fb.mouse_reporting_mode == mode as u16 {
+                fb.mouse_reporting_mode = 0;
             }
         }
-    }
-    for row in (fb.rows - n)..fb.rows {
-        for col in 0..cols {
-            if let Some(c) = fb.cell_at_mut(col, row) {
-                *c = Default::default();
+        1004 => fb.mouse_focus_event = enabled,
+        1005 | 1006 | 1015 => {
+            if enabled {
+                fb.mouse_encoding_mode = mode as u16;
+            } else if fb.mouse_encoding_mode == mode as u16 {
+                fb.mouse_encoding_mode = 0;
             }
         }
+        _ => {}
     }
 }
 
-fn erase_from_cursor(fb: &mut Framebuffer) {
+fn apply_osc(fb: &mut Framebuffer, payload: &[u8]) {
+    if let Some(value) = payload.strip_prefix(b"0;") {
+        fb.icon_name = Some(value.to_vec());
+        fb.window_title = Some(value.to_vec());
+        return;
+    }
+    if let Some(value) = payload.strip_prefix(b"1;") {
+        fb.icon_name = Some(value.to_vec());
+        return;
+    }
+    if let Some(value) = payload.strip_prefix(b"2;") {
+        fb.window_title = Some(value.to_vec());
+        return;
+    }
+    if let Some(value) = payload.strip_prefix(b"52;c;") {
+        fb.clipboard = Some(value.to_vec());
+        return;
+    }
+    if let Some(value) = payload.strip_prefix(b"8;") {
+        let mut fields = value.splitn(2, |byte| *byte == b';');
+        let params = fields.next().unwrap_or_default();
+        let uri = fields.next().unwrap_or_default();
+        fb.set_active_hyperlink(params, uri);
+    }
+}
+
+fn erase_from_cursor(fb: &mut Framebuffer, blank: &Cell) {
     let (cx, cy) = (fb.cur_x, fb.cur_y);
     for y in cy..fb.rows {
         let start = if y == cy { cx } else { 0 };
         for x in start..fb.cols {
             if let Some(c) = fb.cell_at_mut(x, y) {
-                *c = Default::default();
+                *c = blank.clone();
             }
         }
     }
 }
 
-fn erase_to_cursor(fb: &mut Framebuffer) {
+fn erase_to_cursor(fb: &mut Framebuffer, blank: &Cell) {
     let (cx, cy) = (fb.cur_x, fb.cur_y);
     for y in 0..=cy {
         let end = if y == cy {
@@ -513,7 +560,7 @@ fn erase_to_cursor(fb: &mut Framebuffer) {
         };
         for x in 0..=end {
             if let Some(c) = fb.cell_at_mut(x, y) {
-                *c = Default::default();
+                *c = blank.clone();
             }
         }
     }
@@ -534,6 +581,7 @@ fn apply_sgr(pen: &mut AnsiPen, nums: &[u32]) {
             4 => pen.attr.under = true,
             5 | 6 => pen.attr.blink = true,
             7 => pen.attr.reverse = true,
+            8 => pen.attr.conceal = true,
             9 => pen.attr.strike = true,
             22 => {
                 pen.attr.bold = false;
@@ -543,6 +591,7 @@ fn apply_sgr(pen: &mut AnsiPen, nums: &[u32]) {
             24 => pen.attr.under = false,
             25 => pen.attr.blink = false,
             27 => pen.attr.reverse = false,
+            28 => pen.attr.conceal = false,
             29 => pen.attr.strike = false,
             39 => pen.attr.fg = Color::default_color(),
             49 => pen.attr.bg = Color::default_color(),
@@ -687,5 +736,44 @@ mod tests {
         assert!(!fb.next_print_will_wrap);
         assert_eq!(fb.cur_x, 0);
         assert_eq!(fb.cur_y, 0);
+    }
+
+    #[test]
+    fn erase_and_scroll_preserve_the_active_background() {
+        let mut fb = Framebuffer::new(5, 2);
+        let mut pen = AnsiPen::default();
+        apply_ansi_with_pen(
+            &mut fb,
+            &mut pen,
+            b"\x1b[31;48;5;4;4;7m\x1b]8;;https://example.test\x1b\\ABCDE\x1b[1;2H\x1b[3X",
+        );
+        for col in 1..4 {
+            let cell = fb.cell_at(col, 0).unwrap();
+            assert_eq!(cell.ch, ' ');
+            assert_eq!(cell.attr.bg, Color::index(4));
+            assert_eq!(cell.attr.fg, Color::default_color());
+            assert!(!cell.attr.under);
+            assert!(!cell.attr.reverse);
+            assert_eq!(cell.hyperlink, 0);
+        }
+
+        apply_ansi_with_pen(&mut fb, &mut pen, b"\x1b[2;1H\n");
+        for col in 0..fb.cols {
+            let cell = fb.cell_at(col, 1).unwrap();
+            assert_eq!(cell.attr.bg, Color::index(4));
+            assert_eq!(cell.attr.fg, Color::default_color());
+            assert!(!cell.attr.under);
+            assert!(!cell.attr.reverse);
+            assert_eq!(cell.hyperlink, 0);
+        }
+    }
+
+    #[test]
+    fn x10_mouse_reporting_mode_is_reconstructed() {
+        let mut fb = Framebuffer::new(5, 2);
+        apply_ansi(&mut fb, b"\x1b[?9h");
+        assert_eq!(fb.mouse_reporting_mode, 9);
+        apply_ansi(&mut fb, b"\x1b[?9l");
+        assert_eq!(fb.mouse_reporting_mode, 0);
     }
 }
