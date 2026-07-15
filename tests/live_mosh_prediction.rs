@@ -13,10 +13,14 @@
 //! requires `sshpass`. The remote host must have `mosh-server` and be reachable
 //! over UDP.
 
+use flate2::read::ZlibDecoder;
+use moshcatty::fragment::Fragment;
+use moshcatty::pb::{HostInstruction, TransportInstruction};
 use moshcatty::terminal::strip_ansi;
 use moshcatty::{Client, ConnectionStatus, DisplayPipeline, DisplayPreference, Ocb};
 use socket2::SockRef;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -307,6 +311,8 @@ struct UdpBlackholeProxy {
     worker: Option<JoinHandle<()>>,
 }
 
+type CapturedFragmentGroup = (Option<usize>, HashMap<u16, Vec<u8>>);
+
 impl UdpBlackholeProxy {
     fn start(host: &str, server_port: u16) -> Self {
         let server = (host, server_port)
@@ -440,6 +446,88 @@ impl UdpBlackholeProxy {
             .map(|fragments| fragments.values().sum())
             .max()
             .unwrap_or_default()
+    }
+
+    fn complete_server_instruction_stats(
+        &self,
+        key: &str,
+    ) -> Vec<(u64, u64, usize, usize, usize, usize, bool)> {
+        let ocb = Ocb::from_base64(key).expect("live MOSH_KEY");
+        let mut groups: HashMap<u64, CapturedFragmentGroup> = HashMap::new();
+        for packet in self
+            .server_packets
+            .lock()
+            .expect("server packet capture")
+            .iter()
+        {
+            let Some((_sequence, plaintext)) = ocb.open_datagram(packet) else {
+                continue;
+            };
+            let Ok(fragment) = Fragment::decode(plaintext.get(4..).unwrap_or_default()) else {
+                continue;
+            };
+            let entry = groups.entry(fragment.id).or_default();
+            if fragment.is_final {
+                entry.0 = Some(fragment.fragment_num as usize + 1);
+            }
+            entry
+                .1
+                .entry(fragment.fragment_num)
+                .or_insert(fragment.payload);
+        }
+
+        let mut stats = Vec::new();
+        for (_id, (total, fragments)) in groups {
+            let Some(total) = total else {
+                continue;
+            };
+            if (0..total).any(|index| !fragments.contains_key(&(index as u16))) {
+                continue;
+            }
+            let mut compressed = Vec::new();
+            for index in 0..total {
+                compressed.extend_from_slice(&fragments[&(index as u16)]);
+            }
+            let mut decoded = Vec::new();
+            if ZlibDecoder::new(compressed.as_slice())
+                .read_to_end(&mut decoded)
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(transport) = TransportInstruction::decode(&decoded) else {
+                continue;
+            };
+            let Ok(host) = HostInstruction::decode_message(&transport.diff) else {
+                continue;
+            };
+            let host_bytes = host
+                .iter()
+                .map(|instruction| instruction.hoststring.len())
+                .sum();
+            let x_count = host
+                .iter()
+                .flat_map(|instruction| instruction.hoststring.iter())
+                .filter(|&&byte| byte == b'X')
+                .count();
+            let has_done = host.iter().any(|instruction| {
+                instruction
+                    .hoststring
+                    .windows(12)
+                    .any(|w| w == b"MCLARGE_DONE")
+            });
+            stats.push((
+                transport.new_num,
+                transport.old_num,
+                compressed.len(),
+                transport.diff.len(),
+                host_bytes,
+                x_count,
+                has_done,
+            ));
+        }
+        stats.sort_unstable_by_key(|stat| stat.0);
+        stats
     }
 }
 
@@ -616,7 +704,9 @@ fn live_client_survives_resize_and_more_keys() {
 
     let (port, key, server_guard) =
         start_remote_mosh_server(&host, &user, password.as_deref(), ssh_key.as_deref());
-    let mut client = Client::dial_with_size(&host, port, &key, 100, 30).expect("dial");
+    let mut client =
+        Client::dial_candidates_with_size(&["127.0.0.2", host.as_str()], port, &key, 100, 30)
+            .expect("dial candidates");
     let _ = poll_until(&mut client, Instant::now() + Duration::from_secs(2), |_| {
         false
     });
@@ -683,22 +773,44 @@ fn live_large_screen_update_reassembles_against_stock_server() {
     // Keep the server isolated while it builds a 100,000-cell state with
     // unique combining marks. This makes stock mosh-server send one compressed
     // instruction above 1 MiB after the route recovers, including on 1.3.x.
-    let command = b"sleep 1; python3 -c 'import hashlib,sys;s=\"\".join(\"X\"+\"\".join(chr(0x300+b%112) for b in hashlib.shake_256(str(i).encode()).digest(15)) for i in range(68000));sys.stdout.buffer.write(s.encode()+b\"\\033[70;1HMCLARGE_DONE\")'\n";
+    let command = b"printf 'MCLARGE_ARMED\\n'; sleep 1; python3 -c 'import hashlib,sys;s=\"\".join(\"X\"+\"\".join(chr(0x300+b%112) for b in hashlib.shake_256(str(i).encode()).digest(15)) for i in range(68000));sys.stdout.buffer.write(s.encode()+b\"\\033[70;1HMCLARGE_DONE\")'\n";
     client.send_keys(command);
-    client.poll().expect("send large-state command");
-    thread::sleep(Duration::from_millis(100));
+    let armed_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < armed_deadline {
+        client.poll().expect("send large-state command");
+        if framebuffer_text(&client)
+            .lines()
+            .any(|line| line == "MCLARGE_ARMED")
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    assert!(
+        framebuffer_text(&client)
+            .lines()
+            .any(|line| line == "MCLARGE_ARMED"),
+        "large-state command was not confirmed before isolating the server"
+    );
+    proxy.clear_server_packets();
     proxy.set_blackholed(true);
     thread::sleep(Duration::from_secs(4));
     proxy.set_blackholed(false);
 
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut final_screen = String::new();
+    let mut filled_rows = 0;
     while Instant::now() < deadline {
         client.poll().expect("poll");
         final_screen = framebuffer_text(&client);
-        if final_screen
+        filled_rows = final_screen
             .lines()
-            .any(|line| line.contains("MCLARGE_DONE"))
+            .filter(|line| line.len() == 1000 && line.bytes().all(|byte| byte == b'X'))
+            .count();
+        if filled_rows >= 45
+            && final_screen
+                .lines()
+                .any(|line| line.contains("MCLARGE_DONE"))
         {
             break;
         }
@@ -711,14 +823,12 @@ fn live_large_screen_update_reassembles_against_stock_server() {
             .any(|line| line.contains("MCLARGE_DONE")),
         "large output never reached its sentinel; screen={final_screen:?}"
     );
-    let filled_rows = final_screen
-        .lines()
-        .filter(|line| line.len() == 1000 && line.bytes().all(|byte| byte == b'X'))
-        .count();
     assert!(
         filled_rows >= 45,
-        "large fragmented terminal state was truncated; rows={filled_rows}, wire_bytes={}",
-        proxy.largest_server_instruction_payload(&key)
+        "large fragmented terminal state was truncated; rows={filled_rows}, wire_bytes={}, row_widths={:?}, instructions={:?}",
+        proxy.largest_server_instruction_payload(&key),
+        final_screen.lines().map(str::len).collect::<Vec<_>>(),
+        proxy.complete_server_instruction_stats(&key)
     );
     assert!(
         proxy.has_fragmented_server_instruction(&key),

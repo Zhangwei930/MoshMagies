@@ -91,6 +91,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| format!("invalid port: {}", args[1]))?;
     let mut key = env::var("MOSH_KEY").map_err(|_| "MOSH_KEY environment variable is required")?;
     env::remove_var("MOSH_KEY");
+    let fallback_host = env::var("MOSH_FALLBACK_HOST").ok();
+    env::remove_var("MOSH_FALLBACK_HOST");
 
     let cols = env::var("COLUMNS")
         .ok()
@@ -103,7 +105,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(term_rows)
         .unwrap_or(24u16);
 
-    let client_result = Client::dial_with_size(&host, port, &key, cols, rows);
+    let mut hosts = vec![host.as_str()];
+    if let Some(fallback) = fallback_host.as_deref().filter(|value| *value != host) {
+        hosts.push(fallback);
+    }
+    let client_result = Client::dial_candidates_with_size(&hosts, port, &key, cols, rows);
     key.zeroize();
     let mut client = client_result?;
 

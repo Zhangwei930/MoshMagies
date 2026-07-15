@@ -58,6 +58,10 @@ impl EcnSocket {
         self.socket.local_addr()
     }
 
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer
+    }
+
     pub fn send(&self, bytes: &[u8]) -> io::Result<usize> {
         self.send_with_ecn(bytes, EcnCodepoint::Ect0)
     }

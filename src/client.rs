@@ -19,12 +19,18 @@ use crate::transport::Transport;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(8);
 const MAX_DATAGRAM_SIZE: usize = 2048;
+/// Bound receive work per caller turn so a busy or hostile UDP path cannot
+/// starve local input and prediction. Stock mosh receives one packet per
+/// select-loop turn; a larger bounded batch preserves fast fragment assembly
+/// without restoring the old unbounded drain.
+const MAX_RECEIVE_BATCHES_PER_POLL: usize = 1024;
 /// Stock mosh only times out the initial attachment; an established session
 /// remains resumable across long network outages.
 const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const PORT_HOP_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_OLD_SOCKET_AGE: Duration = Duration::from_secs(60);
 const MAX_PORTS_OPEN: usize = 10;
+const MAX_BOOTSTRAP_ADDRESSES: usize = 16;
 const IPV6_FRAGMENT_PAYLOAD: usize = 1178;
 const FALLBACK_FRAGMENT_PAYLOAD: usize = 462;
 const CONNECTING_NOTICE_AFTER: Duration = Duration::from_millis(250);
@@ -147,25 +153,84 @@ impl Client {
     /// Connect with the actual local terminal size so state 0 matches the
     /// server-side terminal before the first resize instruction is applied.
     pub fn dial_with_size(host: &str, port: u16, key: &str, cols: u16, rows: u16) -> Result<Self> {
-        let ocb = Ocb::from_base64(key)?;
-        let addr = (host, port)
-            .to_socket_addrs()
-            .map_err(Error::Io)?
-            .next()
-            .ok_or_else(|| Error::Other(format!("could not resolve {host}:{port}")))?;
+        Self::dial_candidates_with_size(&[host], port, key, cols, rows)
+    }
 
-        let socket = Self::open_socket(addr)?;
-        let receive_buffer = vec![0; socket.receive_buffer_size(MAX_DATAGRAM_SIZE)];
+    /// Try every resolved bootstrap endpoint until one returns an
+    /// authenticated state. This mirrors stock mosh's use of the exact SSH
+    /// endpoint and avoids sending UDP only to the first DNS result.
+    pub fn dial_candidates_with_size(
+        hosts: &[&str],
+        port: u16,
+        key: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
+        let ocb = Ocb::from_base64(key)?;
+        let mut addresses = Vec::new();
+        let mut last_resolution_error = None;
+        for host in hosts {
+            let resolved = match (*host, port).to_socket_addrs() {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    last_resolution_error = Some(error);
+                    continue;
+                }
+            };
+            for address in resolved {
+                if !addresses.contains(&address) {
+                    addresses.push(address);
+                    if addresses.len() == MAX_BOOTSTRAP_ADDRESSES {
+                        break;
+                    }
+                }
+            }
+            if addresses.len() == MAX_BOOTSTRAP_ADDRESSES {
+                break;
+            }
+        }
+        if addresses.is_empty() {
+            return Err(last_resolution_error.map_or_else(
+                || {
+                    Error::Other(format!(
+                        "could not resolve a mosh endpoint on UDP port {port}"
+                    ))
+                },
+                Error::Io,
+            ));
+        }
+
+        let mut sockets = VecDeque::new();
+        let mut receive_buffer_size = MAX_DATAGRAM_SIZE;
+        let mut last_open_error = None;
+        for address in addresses {
+            match Self::open_socket(address) {
+                Ok(socket) => {
+                    receive_buffer_size =
+                        receive_buffer_size.max(socket.receive_buffer_size(MAX_DATAGRAM_SIZE));
+                    sockets.push_back(socket);
+                }
+                Err(error) => last_open_error = Some(error),
+            }
+        }
+        if sockets.is_empty() {
+            return Err(last_open_error.unwrap_or_else(|| {
+                Error::Other("could not open a UDP socket for any mosh endpoint".into())
+            }));
+        }
+        let has_ipv6_candidate = sockets.iter().any(|socket| socket.peer_addr().is_ipv6());
+        let remote_addr = sockets.front().expect("non-empty sockets").peer_addr();
+        let receive_buffer = vec![0; receive_buffer_size];
 
         let mut transport = Transport::new_client(ocb);
-        if addr.is_ipv6() {
+        if has_ipv6_candidate {
             transport.set_max_fragment_payload(IPV6_FRAGMENT_PAYLOAD);
         }
         transport.force_next_send();
         let mut client = Self {
-            sockets: VecDeque::from([socket]),
+            sockets,
             receive_buffer,
-            remote_addr: addr,
+            remote_addr,
             last_port_choice: Instant::now(),
             transport,
             terminal: TerminalView::new(cols, rows),
@@ -294,17 +359,30 @@ impl Client {
         let mut paint = Vec::new();
         let buf = &mut self.receive_buffer;
         let mut received_datagram = false;
-        for socket in &self.sockets {
-            loop {
+        let was_attached = self.transport.has_received_authenticated();
+        let mut authenticated_socket_index = None;
+        // Visit every open migration socket once per round. This prevents an
+        // old, flooded path from starving the newest port while still giving
+        // the caller a predictable chance to service keyboard input.
+        let mut received_batches = 0;
+        'receive: loop {
+            let mut received_this_round = false;
+            for (socket_index, socket) in self.sockets.iter().enumerate() {
+                if received_batches >= MAX_RECEIVE_BATCHES_PER_POLL {
+                    break 'receive;
+                }
                 match socket.recv(buf) {
                     Ok(datagrams) => {
                         received_datagram = true;
+                        received_this_round = true;
+                        received_batches += 1;
                         for datagram in datagrams {
                             let end = datagram.offset + datagram.len;
                             if let Some(state) = self.transport.recv_state_with_congestion(
                                 &buf[datagram.offset..end],
                                 datagram.ecn == Some(EcnCodepoint::Ce),
                             ) {
+                                authenticated_socket_index = Some(socket_index);
                                 let chunk = match self.terminal.apply_host_state(
                                     state.old_num,
                                     state.new_num,
@@ -325,11 +403,23 @@ impl Client {
                         if error.kind() == std::io::ErrorKind::WouldBlock
                             || error.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        continue;
                     }
                     // A connected UDP socket can surface transient ICMP and
                     // route errors here. Mosh must keep the session resumable.
-                    Err(_) => break,
+                    Err(_) => continue,
+                }
+            }
+            if !received_this_round {
+                break;
+            }
+        }
+        if !was_attached && self.transport.has_received_authenticated() {
+            if let Some(index) = authenticated_socket_index {
+                if let Some(active_socket) = self.sockets.remove(index) {
+                    self.remote_addr = active_socket.peer_addr();
+                    self.sockets.clear();
+                    self.sockets.push_back(active_socket);
                 }
             }
         }
@@ -483,8 +573,18 @@ impl Client {
             self.mark_dead("mosh session encryption limit reached");
             return Ok(());
         }
-        for dg in datagrams {
-            if let Some(socket) = self.sockets.back() {
+        'send: for dg in datagrams {
+            if !self.transport.has_received_authenticated() {
+                for socket in &self.sockets {
+                    if let Err(error) = socket.send(&dg) {
+                        if is_message_too_long(&error) {
+                            self.transport
+                                .set_max_fragment_payload(FALLBACK_FRAGMENT_PAYLOAD);
+                            break 'send;
+                        }
+                    }
+                }
+            } else if let Some(socket) = self.sockets.back() {
                 // Like stock mosh, reportable UDP send failures do not end the
                 // session; a later port hop or route recovery can resume it.
                 if let Err(error) = socket.send(&dg) {
@@ -767,6 +867,33 @@ mod tests {
     }
 
     #[test]
+    fn client_tries_every_bootstrap_address_until_one_authenticates() {
+        let (port, key, _handle) = spawn_echo_server("MULTI_ADDRESS_OK");
+        let mut client = Client::dial_candidates_with_size(
+            &["not-a-real-mosh-host.invalid", "127.0.0.2", "127.0.0.1"],
+            port,
+            &key,
+            80,
+            24,
+        )
+        .expect("dial candidates");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if !client.poll().unwrap().is_empty() {
+                assert_eq!(
+                    client.remote_addr.ip(),
+                    "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(client.sockets.len(), 1);
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("client never selected the reachable bootstrap address");
+    }
+
+    #[test]
     fn parallel_remote_states_render_shared_content_once() {
         let (port, key, handle) = spawn_parallel_state_server();
         let mut client = Client::dial("127.0.0.1", port, &key).expect("dial");
@@ -796,6 +923,30 @@ mod tests {
 
         assert_eq!(client.remote_framebuffer().cols, 120);
         assert_eq!(client.remote_framebuffer().rows, 40);
+    }
+
+    #[test]
+    fn poll_yields_before_draining_a_network_flood() {
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let mut client = Client::dial("127.0.0.1", port, "AAAAAAAAAAAAAAAAAAAAAA").expect("dial");
+        let client_addr = SocketAddr::from((
+            [127, 0, 0, 1],
+            client.sockets.front().unwrap().local_addr().unwrap().port(),
+        ));
+        let flood = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        for _ in 0..4096 {
+            flood.send_to(b"not-authenticated", client_addr).unwrap();
+        }
+
+        client.poll().expect("poll under flood");
+
+        let mut buffer = [0u8; 2048];
+        assert!(
+            client.sockets.front().unwrap().recv(&mut buffer).is_ok(),
+            "one poll must yield with queued datagrams left so keyboard input gets a turn"
+        );
     }
 
     #[test]
