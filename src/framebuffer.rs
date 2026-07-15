@@ -371,6 +371,45 @@ impl Framebuffer {
         self.rows_data = vec![blank_row; self.rows];
     }
 
+    pub(crate) fn erase_row_range(
+        &mut self,
+        y: usize,
+        start: usize,
+        end_exclusive: usize,
+        blank: &Cell,
+    ) {
+        if y >= self.rows || start >= end_exclusive || start >= self.cols {
+            return;
+        }
+        let mut adjusted_start = start;
+        let mut adjusted_end = end_exclusive.min(self.cols);
+        if adjusted_start > 0
+            && self
+                .cell_at(adjusted_start, y)
+                .is_some_and(|cell| cell.width == 0)
+            && self
+                .cell_at(adjusted_start - 1, y)
+                .is_some_and(|cell| cell.width == 2)
+        {
+            adjusted_start -= 1;
+        }
+        if adjusted_end < self.cols
+            && self
+                .cell_at(adjusted_end - 1, y)
+                .is_some_and(|cell| cell.width == 2)
+            && self
+                .cell_at(adjusted_end, y)
+                .is_some_and(|cell| cell.width == 0)
+        {
+            adjusted_end += 1;
+        }
+        for x in adjusted_start..adjusted_end {
+            if let Some(cell) = self.cell_at_mut(x, y) {
+                *cell = blank.clone();
+            }
+        }
+    }
+
     pub(crate) fn scroll_rows_up(&mut self, top: usize, bottom: usize, lines: usize, blank: &Cell) {
         if top >= self.rows || bottom >= self.rows || top > bottom {
             return;
@@ -494,6 +533,32 @@ impl Framebuffer {
         let w = w.min(2);
         if w == 0 {
             return 0;
+        }
+        // Xterm clears the whole existing wide glyph when a printable cell is
+        // written into its continuation column. Stock Display::new_frame can
+        // legally produce this pattern after a right-margin wide wrap (BS+EL,
+        // followed by spaces in a later frame). Leaving the owner intact makes
+        // the new cell invisible and creates a persistent ghost glyph.
+        let overwrites_wide_continuation = self.cell_at(x, y).is_some_and(|cell| cell.width == 0);
+        if overwrites_wide_continuation && x > 0 {
+            let owns_continuation = self.cell_at(x - 1, y).is_some_and(|cell| cell.width == 2);
+            if owns_continuation {
+                if let Some(owner) = self.cell_at_mut(x - 1, y) {
+                    *owner = Cell::erased(attr.bg);
+                }
+            }
+        }
+        // A new wide glyph can also cover the owner column of a different
+        // wide glyph immediately to its right. Xterm clears that old glyph's
+        // trailing continuation using the active background.
+        let overlaps_wide_owner_on_right = w == 2
+            && x + 2 < self.cols
+            && self.cell_at(x + 1, y).is_some_and(|cell| cell.width == 2)
+            && self.cell_at(x + 2, y).is_some_and(|cell| cell.width == 0);
+        if overlaps_wide_owner_on_right {
+            if let Some(trailing) = self.cell_at_mut(x + 2, y) {
+                *trailing = Cell::erased(attr.bg);
+            }
         }
         let old_width = self.cell_at(x, y).map(|cell| cell.width).unwrap_or(1);
         if let Some(cell) = self.cell_at_mut(x, y) {
@@ -677,6 +742,7 @@ impl Framebuffer {
             if y > 0 {
                 buf.extend_from_slice(b"\r\n");
             }
+            let mut pen_x: isize = 0;
             let visible = visible_cell_starts(self, y);
             let mut last_non_space = None;
             for x in (0..self.cols).rev() {
@@ -699,9 +765,16 @@ impl Framebuffer {
                         continue;
                     }
                     let c = self.cell_at(x, y).expect("framebuffer bounds");
+                    if pen_x != x as isize {
+                        append_cup(&mut buf, y, x);
+                    }
                     append_hyperlink_diff(&mut buf, &mut cur_link, self.hyperlink(c.hyperlink));
                     append_attr_diff(&mut buf, &mut cur_attr, &c.attr);
                     push_cell(&mut buf, c);
+                    // The remote terminal and xterm.js can disagree about
+                    // emoji width. Re-address after any wide cell so later
+                    // paint cannot shift left on the local terminal.
+                    pen_x = next_local_pen_x(c, x);
                 }
             }
         }
@@ -764,7 +837,11 @@ impl Framebuffer {
                 append_hyperlink_diff(&mut buf, &mut cur_link, self.hyperlink(c.hyperlink));
                 append_attr_diff(&mut buf, &mut cur_attr, &c.attr);
                 push_cell(&mut buf, c);
-                pen_x = x as isize + c.width as isize;
+                // Always re-address after a wide cell. The server-side libc
+                // and xterm.js do not agree on every emoji width, so assuming
+                // the local cursor advanced two columns can leave later
+                // erases or glyphs one column short.
+                pen_x = next_local_pen_x(c, x);
             }
         }
 
@@ -1038,6 +1115,19 @@ fn push_cell(buf: &mut Vec<u8>, cell: &Cell) {
         buf.push(b' ');
     } else {
         cell.append_grapheme_to(buf);
+    }
+}
+
+fn next_local_pen_x(cell: &Cell, x: usize) -> isize {
+    let joins_next_grapheme = cell
+        .grapheme_suffix
+        .as_deref()
+        .and_then(|suffix| suffix.chars().last())
+        == Some('\u{200d}');
+    if cell.width == 2 && !joins_next_grapheme {
+        -1
+    } else {
+        x as isize + cell.width.max(1) as isize
     }
 }
 
@@ -1377,6 +1467,19 @@ mod tests {
         assert_eq!(overwritten.attr.bg, Color::index(4));
         assert!(overwritten.attr.under);
         assert!(fb.hyperlink(overwritten.hyperlink).is_some());
+    }
+
+    #[test]
+    fn overlapping_wide_glyph_clears_the_old_trailing_continuation() {
+        let mut fb = Framebuffer::new(5, 1);
+        apply_ansi(&mut fb, "\x1b[41m\x1b[1;2H界\x1b[44m\x1b[1;1H界".as_bytes());
+
+        assert_eq!(fb.cell_at(0, 0).unwrap().ch, '界');
+        assert_eq!(fb.cell_at(0, 0).unwrap().width, 2);
+        assert_eq!(fb.cell_at(1, 0).unwrap().width, 0);
+        assert_eq!(fb.cell_at(2, 0).unwrap().ch, ' ');
+        assert_eq!(fb.cell_at(2, 0).unwrap().width, 1);
+        assert_eq!(fb.cell_at(2, 0).unwrap().attr.bg, Color::index(4));
     }
 
     #[test]

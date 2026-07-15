@@ -502,25 +502,13 @@ fn apply_csi(fb: &mut Framebuffer, pen: &mut AnsiPen, params: &[u8], final_byte:
             let blank = erased_cell(pen);
             match mode {
                 0 => {
-                    for x in fb.cur_x..fb.cols {
-                        if let Some(c) = fb.cell_at_mut(x, y) {
-                            *c = blank.clone();
-                        }
-                    }
+                    fb.erase_row_range(y, fb.cur_x, fb.cols, &blank);
                 }
                 1 => {
-                    for x in 0..=fb.cur_x.min(fb.cols.saturating_sub(1)) {
-                        if let Some(c) = fb.cell_at_mut(x, y) {
-                            *c = blank.clone();
-                        }
-                    }
+                    fb.erase_row_range(y, 0, fb.cur_x.saturating_add(1), &blank);
                 }
                 2 => {
-                    for x in 0..fb.cols {
-                        if let Some(c) = fb.cell_at_mut(x, y) {
-                            *c = blank.clone();
-                        }
-                    }
+                    fb.erase_row_range(y, 0, fb.cols, &blank);
                 }
                 _ => {}
             }
@@ -530,11 +518,7 @@ fn apply_csi(fb: &mut Framebuffer, pen: &mut AnsiPen, params: &[u8], final_byte:
             let n = nums.first().copied().unwrap_or(1).max(1) as usize;
             let y = fb.cur_y;
             let blank = erased_cell(pen);
-            for x in fb.cur_x..(fb.cur_x + n).min(fb.cols) {
-                if let Some(c) = fb.cell_at_mut(x, y) {
-                    *c = blank.clone();
-                }
-            }
+            fb.erase_row_range(y, fb.cur_x, fb.cur_x.saturating_add(n), &blank);
         }
         b'@' => {
             // ICH — insert n blank cells at cursor
@@ -727,11 +711,7 @@ fn erase_from_cursor(fb: &mut Framebuffer, blank: &Cell) {
     let (cx, cy) = (fb.cur_x, fb.cur_y);
     for y in cy..fb.rows {
         let start = if y == cy { cx } else { 0 };
-        for x in start..fb.cols {
-            if let Some(c) = fb.cell_at_mut(x, y) {
-                *c = blank.clone();
-            }
-        }
+        fb.erase_row_range(y, start, fb.cols, blank);
     }
 }
 
@@ -743,11 +723,7 @@ fn erase_to_cursor(fb: &mut Framebuffer, blank: &Cell) {
         } else {
             fb.cols.saturating_sub(1)
         };
-        for x in 0..=end {
-            if let Some(c) = fb.cell_at_mut(x, y) {
-                *c = blank.clone();
-            }
-        }
+        fb.erase_row_range(y, 0, end.saturating_add(1), blank);
     }
 }
 
