@@ -14,10 +14,10 @@
 //! over UDP.
 
 use flate2::read::ZlibDecoder;
-use moshcatty::fragment::Fragment;
-use moshcatty::pb::{HostInstruction, TransportInstruction};
-use moshcatty::terminal::strip_ansi;
-use moshcatty::{Client, ConnectionStatus, DisplayPipeline, DisplayPreference, Ocb};
+use moshmagies::fragment::Fragment;
+use moshmagies::pb::{HostInstruction, TransportInstruction};
+use moshmagies::terminal::strip_ansi;
+use moshmagies::{Client, ConnectionStatus, DisplayPipeline, DisplayPreference, Ocb};
 use socket2::SockRef;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -54,7 +54,7 @@ impl Drop for RemoteServerGuard {
     fn drop(&mut self) {
         let destination = format!("{}@{}", self.user, self.host);
         let remote_cleanup = format!(
-            "pkill -TERM -s {} >/dev/null 2>&1 || true; pkill -TERM -s {} >/dev/null 2>&1 || true; kill {} {} >/dev/null 2>&1 || true; rm -f /tmp/moshcatty-live-{}-*",
+            "pkill -TERM -s {} >/dev/null 2>&1 || true; pkill -TERM -s {} >/dev/null 2>&1 || true; kill {} {} >/dev/null 2>&1 || true; rm -f /tmp/moshmagies-live-{}-*",
             self.session_id, self.child_session_id, self.child_pid, self.pid, self.pid
         );
         let mut command;
@@ -325,7 +325,7 @@ fn framebuffer_text(client: &Client) -> String {
     framebuffer_text_from_frame(client.remote_framebuffer())
 }
 
-fn framebuffer_text_from_frame(frame: &moshcatty::Framebuffer) -> String {
+fn framebuffer_text_from_frame(frame: &moshmagies::Framebuffer) -> String {
     (0..frame.rows)
         .map(|y| {
             (0..frame.cols)
@@ -704,7 +704,7 @@ fn live_echo_and_prediction_pipeline_no_double_glyph() {
     assert_eq!(
         screen.matches("hello").count(),
         1,
-        "expected one hello on the final screen (Netcatty #2121); screen={screen:?} host={:?}",
+        "expected one hello on the final screen (MagiesTerminal #2121); screen={screen:?} host={:?}",
         strip_ansi(&String::from_utf8_lossy(&host_acc))
     );
 
@@ -849,9 +849,9 @@ fn live_large_screen_update_reassembles_against_stock_server() {
     // then wait one second before painting it. The deterministic unit path
     // covers the 1 MiB protocol boundary; this live path keeps a realistic
     // multi-fragment update fast enough for public-host verification.
-    let completion_marker = format!("/tmp/moshcatty-live-{}-large-done", server_guard.pid);
+    let completion_marker = format!("/tmp/moshmagies-live-{}-large-done", server_guard.pid);
     let command = format!(
-        "python3 -c 'import hashlib,sys,time;b=hashlib.shake_256(b\"moshcatty-large-screen\").digest(23600);s=bytes(33+x%94 for x in b);print(\"MCLARGE_\"+\"ARMED\",flush=True);time.sleep(1);sys.stdout.buffer.write(s+b\"\\033[60;1HMCLARGE_DONE\");sys.stdout.buffer.flush();open(\"{}\",\"w\").close()'\n",
+        "python3 -c 'import hashlib,sys,time;b=hashlib.shake_256(b\"moshmagies-large-screen\").digest(23600);s=bytes(33+x%94 for x in b);print(\"MCLARGE_\"+\"ARMED\",flush=True);time.sleep(1);sys.stdout.buffer.write(s+b\"\\033[60;1HMCLARGE_DONE\");sys.stdout.buffer.flush();open(\"{}\",\"w\").close()'\n",
         completion_marker
     );
     client.send_keys(command.as_bytes());

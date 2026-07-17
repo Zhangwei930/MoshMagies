@@ -29,8 +29,8 @@ const child = pty.spawn(executable, [], {
   cwd: process.cwd(),
   env: {
     ...process.env,
-    MOSHCATTY_CONPTY_TEST: "1",
-    MOSHCATTY_CONPTY_TEST_BYTES: String(Buffer.byteLength(input, "utf8")),
+    MOSHMAGIES_CONPTY_TEST: "1",
+    MOSHMAGIES_CONPTY_TEST_BYTES: String(Buffer.byteLength(input, "utf8")),
   },
 });
 
@@ -46,12 +46,12 @@ const timeout = setTimeout(() => {
 
 child.onData((data) => {
   output += data;
-  if (!inputSent && output.includes("MOSHCATTY_CONPTY_READY")) {
+  if (!inputSent && output.includes("MOSHMAGIES_CONPTY_READY")) {
     inputSent = true;
     child.write(input);
   }
   const match = output.match(
-    new RegExp(`MOSHCATTY_INPUT_HEX=([0-9a-f]{${expectedHex.length}})\\r?\\n`, "i"),
+    new RegExp(`MOSHMAGIES_INPUT_HEX=([0-9a-f]{${expectedHex.length}})\\r?\\n`, "i"),
   );
   if (!match || settled) return;
   settled = true;

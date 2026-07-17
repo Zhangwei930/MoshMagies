@@ -1,4 +1,4 @@
-//! **MoshCatty** — pure Rust Mosh client, wire-compatible with stock `mosh-server`.
+//! **MoshMagies** — pure Rust Mosh client, wire-compatible with stock `mosh-server`.
 //!
 //! Protocol layers (bottom → top):
 //! - [`crypto`] — AES-128-OCB3 (RFC 7253) + mosh datagram framing
@@ -11,7 +11,7 @@
 //! - [`prediction`] — Predictor + DisplayPipeline (Confirm/Overlay)
 //! - [`client`] — high-level UDP session
 //!
-//! Built for [Netcatty](https://github.com/binaricat/Netcatty) and standalone use.
+//! Built for [MagiesTerminal](https://github.com/Zhangwei930/MgTerminal) and standalone use.
 //! No Cygwin, no terminfo database, no platform DLL bag.
 
 #![deny(unsafe_code)]

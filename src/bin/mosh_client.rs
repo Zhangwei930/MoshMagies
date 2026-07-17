@@ -1,4 +1,4 @@
-//! Drop-in `mosh-client` CLI for Netcatty (and standalone use).
+//! Drop-in `mosh-client` CLI for MagiesTerminal (and standalone use).
 //!
 //! ```text
 //! MOSH_KEY=<key> mosh-client <host> <port>
@@ -10,7 +10,7 @@
 //! - Windows: dedicated stdin thread so UDP poll/keepalive never block
 //!   (fixes ConPTY/node-pty stall — multi-agent audit CRITICAL);
 //!   also installs a console ctrl handler so ConPTY Ctrl+C is not
-//!   STATUS_CONTROL_C_EXIT (Netcatty / node-pty path)
+//!   STATUS_CONTROL_C_EXIT (MagiesTerminal / node-pty path)
 
 use std::env;
 use std::io::{self, Read, Write};
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use moshcatty::{Client, DisplayPipeline, DisplayPreference};
+use moshmagies::{Client, DisplayPipeline, DisplayPreference};
 use zeroize::Zeroize;
 
 fn main() {
@@ -55,7 +55,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     disable_core_dumps()?;
 
     #[cfg(all(windows, debug_assertions, feature = "conpty-test-probe"))]
-    if env::var_os("MOSHCATTY_CONPTY_TEST").is_some() {
+    if env::var_os("MOSHMAGIES_CONPTY_TEST").is_some() {
         return run_conpty_input_probe();
     }
 
@@ -128,7 +128,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _display = DisplaySession::enter(&mut stdout)?;
     // mosh-go / stock shape: HostBytes → client Framebuffer → Confirm →
     // Overlay → Diff(last_shown) → single PTY stream. Never dual-write raw
-    // predicted glyphs beside HostBytes (Netcatty #2121).
+    // predicted glyphs beside HostBytes (MagiesTerminal #2121).
     let mut display =
         DisplayPipeline::new(cols as usize, rows as usize, DisplayPreference::from_env());
     let mut local_escape = LocalEscape::from_env();
@@ -276,17 +276,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(all(windows, debug_assertions, feature = "conpty-test-probe"))]
 fn run_conpty_input_probe() -> Result<(), Box<dyn std::error::Error>> {
     const MAX_PROBE_BYTES: usize = 4096;
-    let expected_bytes: usize = env::var("MOSHCATTY_CONPTY_TEST_BYTES")
-        .map_err(|_| "MOSHCATTY_CONPTY_TEST_BYTES is required")?
+    let expected_bytes: usize = env::var("MOSHMAGIES_CONPTY_TEST_BYTES")
+        .map_err(|_| "MOSHMAGIES_CONPTY_TEST_BYTES is required")?
         .parse()
-        .map_err(|_| "MOSHCATTY_CONPTY_TEST_BYTES must be an integer")?;
+        .map_err(|_| "MOSHMAGIES_CONPTY_TEST_BYTES must be an integer")?;
     if expected_bytes > MAX_PROBE_BYTES {
-        return Err("MOSHCATTY_CONPTY_TEST_BYTES exceeds the probe limit".into());
+        return Err("MOSHMAGIES_CONPTY_TEST_BYTES exceeds the probe limit".into());
     }
     let running = Arc::new(AtomicBool::new(true));
     install_signal_flag(running);
     let _raw_guard = enter_raw_mode_if_tty()?.ok_or("ConPTY test probe requires a console")?;
-    println!("MOSHCATTY_CONPTY_READY");
+    println!("MOSHMAGIES_CONPTY_READY");
     io::stdout().flush()?;
     let mut input = vec![0u8; expected_bytes];
     io::stdin().read_exact(&mut input)?;
@@ -294,7 +294,7 @@ fn run_conpty_input_probe() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    println!("MOSHCATTY_INPUT_HEX={hex}");
+    println!("MOSHMAGIES_INPUT_HEX={hex}");
     Ok(())
 }
 
@@ -372,7 +372,7 @@ fn spawn_stdin_reader() -> Receiver<Option<Vec<u8>>> {
 
 fn print_usage() {
     eprintln!("Usage: MOSH_KEY=<key> mosh-client <host> <port>");
-    eprintln!("Pure Rust Mosh client (Netcatty). No Cygwin / terminfo required.");
+    eprintln!("Pure Rust Mosh client (MagiesTerminal). No Cygwin / terminfo required.");
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -466,7 +466,7 @@ impl LocalEscape {
                         quit: true,
                     };
                 }
-                // Stock suspends the local Unix process here. MoshCatty runs
+                // Stock suspends the local Unix process here. MoshMagies runs
                 // as a managed PTY child on every platform, so consume the
                 // command without forwarding Ctrl-Z to the remote shell.
                 if byte == 0x1a {
@@ -546,7 +546,7 @@ fn term_rows() -> Option<u16> {
 }
 
 /// Live console size on Windows (ConPTY / node-pty). Prefer this over env so
-/// Netcatty resizeSession updates reach mosh-server as UserInstruction::resize.
+/// MagiesTerminal resizeSession updates reach mosh-server as UserInstruction::resize.
 #[cfg(windows)]
 fn winsize_windows() -> Option<(u16, u16)> {
     use std::mem::MaybeUninit;
@@ -781,7 +781,7 @@ fn install_signal_flag(running: Arc<AtomicBool>) {
     }
 }
 
-/// Ignore CTRL+C / CTRL+BREAK as process-kill under ConPTY (Netcatty/node-pty).
+/// Ignore CTRL+C / CTRL+BREAK as process-kill under ConPTY (MagiesTerminal/node-pty).
 /// The `\x03` byte is still delivered on stdin and forwarded to mosh-server so
 /// the *remote* foreground process is interrupted — matching Unix mosh-client
 /// after `cfmakeraw` (ISIG off).

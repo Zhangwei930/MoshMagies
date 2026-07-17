@@ -2,7 +2,7 @@
 //!
 //! Stock mosh-server puts `Display::new_frame` output in HostBytes.hoststring
 //! (ANSI-like paint). Writing that stream to a real PTY/xterm is correct for
-//! Netcatty's node-pty sandwich and eliminates the Cygwin terminfo path.
+//! MagiesTerminal's node-pty sandwich and eliminates the Cygwin terminfo path.
 
 use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -832,7 +832,7 @@ mod tests {
 
     #[test]
     fn client_dial_recv_and_command_against_fake_server() {
-        let marker = "NETCATTY_MOSH_UNIT_OK";
+        let marker = "MAGIESTERMINAL_MOSH_UNIT_OK";
         let (port, key, handle) = spawn_echo_server(marker);
 
         let mut client = Client::dial("127.0.0.1", port, &key).expect("dial");

@@ -1,44 +1,44 @@
 <p align="center">
-  <img src="assets/logo-256.png" alt="MoshCatty" width="128" height="128">
+  <img src="assets/logo-256.png" alt="MoshMagies" width="128" height="128">
 </p>
 
-<h1 align="center">MoshCatty</h1>
+<h1 align="center">MoshMagies</h1>
 
 <p align="center">
   <strong>Pure Rust Mosh client — cross-platform, wire-compatible, no Cygwin</strong><br/>
-  Built for <a href="https://github.com/binaricat/Netcatty"><strong>Netcatty</strong></a> · usable anywhere
+  Built for <a href="https://github.com/Zhangwei930/MgTerminal"><strong>MagiesTerminal</strong></a> · usable anywhere
 </p>
 
 <p align="center">
-  <a href="https://github.com/binaricat/MoshCatty/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/binaricat/MoshCatty/ci.yml?branch=main&style=for-the-badge&logo=github&label=CI"></a>
+  <a href="https://github.com/Zhangwei930/MoshMagies/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Zhangwei930/MoshMagies/ci.yml?branch=main&style=for-the-badge&logo=github&label=CI"></a>
   &nbsp;
-  <a href="https://github.com/binaricat/MoshCatty/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/binaricat/MoshCatty?style=for-the-badge&logo=github&label=Release"></a>
+  <a href="https://github.com/Zhangwei930/MoshMagies/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Zhangwei930/MoshMagies?style=for-the-badge&logo=github&label=Release"></a>
   &nbsp;
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-GPL--3.0-green?style=for-the-badge"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/binaricat/MoshCatty/releases/latest">
-    <img src="https://img.shields.io/github/v/release/binaricat/MoshCatty?style=for-the-badge&logo=github&label=Download%20Latest&color=success" alt="Download Latest Release">
+  <a href="https://github.com/Zhangwei930/MoshMagies/releases/latest">
+    <img src="https://img.shields.io/github/v/release/Zhangwei930/MoshMagies?style=for-the-badge&logo=github&label=Download%20Latest&color=success" alt="Download Latest Release">
   </a>
 </p>
 
 ---
 
-## What is MoshCatty?
+## What is MoshMagies?
 
-**MoshCatty** is a pure Rust implementation of a [Mosh](https://mosh.org) **client**.
+**MoshMagies** is a pure Rust implementation of a [Mosh](https://mosh.org) **client**.
 
 It speaks the real Mosh wire protocol (AES-128-OCB3, SSP, fragments, HostBytes paint) against stock `mosh-server` on Linux/macOS/Windows — **without** Cygwin, terminfo databases, or DLL bags.
 
-It is the default path Netcatty uses to ship a reliable multi-platform Mosh client (especially on Windows, where classical Cygwin glue breaks).
+It is the default path MagiesTerminal uses to ship a reliable multi-platform Mosh client (especially on Windows, where classical Cygwin glue breaks).
 
 ```text
-  SSH bootstrap (Netcatty / your tool)
+  SSH bootstrap (MagiesTerminal / your tool)
            │
            ▼  MOSH CONNECT <port> <key>
   ┌────────────────────┐
-  │   mosh-client      │  ← MoshCatty binary
+  │   mosh-client      │  ← MoshMagies binary
   │  pure Rust · UDP   │
   └─────────┬──────────┘
             │  AES-OCB · SSP · HostBytes
@@ -54,9 +54,9 @@ It is the default path Netcatty uses to ship a reliable multi-platform Mosh clie
 |----------|-----------------|
 | Cygwin `mosh-client` + partial DLLs | Cursor-only / terminfo / PTY sandwich failures |
 | FluentTerminal old PE | Stale provenance, encoding issues |
-| **MoshCatty** | One binary (Windows CRT static-linked), same protocol stack everywhere |
+| **MoshMagies** | One binary (Windows CRT static-linked), same protocol stack everywhere |
 
-Peer products either skip Windows Mosh or own a private engine. MoshCatty is the open, Netcatty-aligned engine.
+Peer products either skip Windows Mosh or own a private engine. MoshMagies is the open, MagiesTerminal-aligned engine.
 
 ---
 
@@ -74,9 +74,9 @@ Peer products either skip Windows Mosh or own a private engine. MoshCatty is the
   last-reply notification bar, cleared automatically after the path recovers
 - **Local escape command**: `Ctrl-^ .` quits and `Ctrl-^ ^` sends a literal
   `Ctrl-^`, with `MOSH_ESCAPE_KEY` configuration
-- **Library API** (`moshcatty` crate) for embedders
+- **Library API** (`moshmagies` crate) for embedders
 - **RFC 7253** AES-128-OCB3 + mosh-go interop vectors in CI
-- **Netcatty-ready**: fits existing SSH bootstrap + node-pty swap
+- **MagiesTerminal-ready**: fits existing SSH bootstrap + node-pty swap
 
 ---
 
@@ -84,7 +84,7 @@ Peer products either skip Windows Mosh or own a private engine. MoshCatty is the
 
 ### From GitHub Releases
 
-Download the archive for your platform from the [latest release](https://github.com/binaricat/MoshCatty/releases/latest):
+Download the archive for your platform from the [latest release](https://github.com/Zhangwei930/MoshMagies/releases/latest):
 
 | Asset | Platform |
 |-------|----------|
@@ -103,8 +103,8 @@ MOSH_KEY=... ./mosh-client 203.0.113.10 60001
 ### From source
 
 ```sh
-git clone https://github.com/binaricat/MoshCatty.git
-cd MoshCatty
+git clone https://github.com/Zhangwei930/MoshMagies.git
+cd MoshMagies
 cargo build --release
 # binary: target/release/mosh-client
 ```
@@ -115,7 +115,7 @@ Requires **Rust 1.75+**.
 
 ## Usage
 
-MoshCatty is the **network client only**. You (or Netcatty) still run SSH to start `mosh-server` and obtain:
+MoshMagies is the **network client only**. You (or MagiesTerminal) still run SSH to start `mosh-server` and obtain:
 
 ```text
 MOSH CONNECT <udp-port> <base64-key>
@@ -136,7 +136,7 @@ mosh-client 192.0.2.10 60001
 | `MOSH_PREDICTION_DISPLAY` | `adaptive` (default), `always`, `never`, or `experimental` |
 | `MOSH_PREDICTION_OVERWRITE` | `yes` to predict overwrite-mode input |
 | `MOSH_ESCAPE_KEY` | One ASCII byte for the local command prefix; empty disables it (default `Ctrl-^`) |
-| `MOSH_NO_TERM_INIT` | Skip local alternate-screen setup (Netcatty sets this) |
+| `MOSH_NO_TERM_INIT` | Skip local alternate-screen setup (MagiesTerminal sets this) |
 | `COLUMNS` / `LINES` | Initial / fallback terminal size |
 | (Unix) live winsize | Polled via `TIOCGWINSZ` |
 | (Windows) console size | Polled via `GetConsoleScreenBufferInfo` |
@@ -157,21 +157,21 @@ Stock mosh-server does not implement DEC 1049 dual buffers, so residual cells
 after quitting a full-screen remote app can still appear — that is an upstream
 server limitation, not fixed solely by client smcup/rmcup.
 
-### Windows / ConPTY (Netcatty, node-pty)
+### Windows / ConPTY (MagiesTerminal, node-pty)
 
 Under ConPTY, Ctrl+C raises a Windows `CTRL_C_EVENT` in addition to the `\x03`
-byte on stdin. MoshCatty installs a console control handler that **ignores**
+byte on stdin. MoshMagies installs a console control handler that **ignores**
 `CTRL_C` / `CTRL_BREAK` as process-kill signals, and clears cooked console input
 flags analogous to Unix `cfmakeraw` (ISIG off). Result: Ctrl+C interrupts the
 *remote* shell instead of exiting the client with `STATUS_CONTROL_C_EXIT`.
 
-MoshCatty also enables virtual-terminal input before reading stdin. This keeps
+MoshMagies also enables virtual-terminal input before reading stdin. This keeps
 the escape sequences that ConPTY receives from terminal hosts intact, including
 arrow keys, Ctrl/Alt-modified arrows, and Alt shortcuts.
 
 The local Mosh command prefix works under ConPTY as well: `Ctrl-^ .` closes the
 Mosh session, and `Ctrl-^ ^` sends a literal `Ctrl-^` to the remote program.
-MoshCatty deliberately does not implement stock Mosh's Unix job-control suspend
+MoshMagies deliberately does not implement stock Mosh's Unix job-control suspend
 command because suspending a child ConPTY can also stall its host application;
 that local command is consumed and is never forwarded as Ctrl-Z to the remote
 shell.
@@ -196,9 +196,9 @@ dumpbin /dependents target/release/mosh-client.exe
 # should not list VCRUNTIME140 or api-ms-win-crt-*
 ```
 
-### Linux glibc floors (Netcatty packaging)
+### Linux glibc floors (MagiesTerminal packaging)
 
-Release Linux binaries are built on the **same distro baseline Netcatty packages
+Release Linux binaries are built on the **same distro baseline MagiesTerminal packages
 against**, not on bare `ubuntu-latest` (which links a newer glibc and fails to
 start on older supported installs):
 
@@ -248,24 +248,24 @@ Tests include RFC 7253 empty-AAD vectors, mosh-go interop vectors, fragment OOO 
 
 ---
 
-## Releases & Netcatty integration
+## Releases & MagiesTerminal integration
 
 CI builds multi-platform `mosh-client` archives and publishes GitHub Releases with tags:
 
 ```text
-moshcatty-0.1.4
+moshmagies-0.1.4
 ```
 
-[Netcatty](https://github.com/binaricat/Netcatty) pulls those assets the same way it previously used `Netcatty-mosh-bin`:
+[MagiesTerminal](https://github.com/Zhangwei930/MgTerminal) pulls those assets the same way it previously used `MagiesTerminal-mosh-bin`:
 
 ```text
-MOSH_BIN_OWNER=binaricat
-MOSH_BIN_REPO=MoshCatty
-MOSH_BIN_RELEASE=moshcatty-0.1.4   # or resolve latest moshcatty-*
+MOSH_BIN_OWNER=Zhangwei930
+MOSH_BIN_REPO=MoshMagies
+MOSH_BIN_RELEASE=moshmagies-0.1.4   # or resolve latest moshmagies-*
 npm run fetch:mosh
 ```
 
-Artifact names stay Netcatty-compatible:
+Artifact names stay MagiesTerminal-compatible:
 
 ```text
 mosh-client-linux-x64.tar.gz
@@ -279,12 +279,12 @@ SHA256SUMS
 
 ## License
 
-**GPL-3.0-or-later** — same family as [Mosh](https://github.com/mobile-shell/mosh) and [Netcatty](https://github.com/binaricat/Netcatty).
+**GPL-3.0-or-later** — same family as [Mosh](https://github.com/mobile-shell/mosh) and [MagiesTerminal](https://github.com/Zhangwei930/MgTerminal).
 
 Protocol references: Mosh paper / upstream field numbers; interop vectors from [mosh-go](https://github.com/unixshells/mosh-go) (MIT). No AGPL code is vendored.
 
 ---
 
 <p align="center">
-  Made with 🐱 for the Netcatty ecosystem
+  Made with 🐱 for the MagiesTerminal ecosystem
 </p>

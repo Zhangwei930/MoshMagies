@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local packaging helper (mirrors CI release layout for Netcatty).
+# Local packaging helper (mirrors CI release layout for MagiesTerminal).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${OUT_DIR:-$ROOT/out}"
