@@ -396,6 +396,30 @@ fn backspace_waits_for_a_host_frame_before_local_echo_resumes() {
 }
 
 #[test]
+fn backspace_does_not_resume_on_an_ack_without_a_host_frame() {
+    let mut pipe = DisplayPipeline::new(40, 10, DisplayPreference::Always);
+    pipe.prove_band_for_test();
+    let _ = pipe.on_host_bytes(b"abc");
+    let _ = pipe.set_frames_late_for_test(10, 10, 10);
+
+    let _ = pipe.on_keystroke(&[0x7f]);
+    let _ = pipe.set_frames_late_for_test(11, 11, 10);
+
+    // The host acknowledges the erase without sending a newer screen state.
+    let _ = pipe.set_frames_late_for_test(11, 11, 11);
+    assert!(pipe.on_keystroke(b"x").is_empty());
+    assert_eq!(pipe.predictor().pending_len(), 0);
+    let _ = pipe.set_frames_late_for_test(12, 12, 11);
+
+    // A later authoritative screen state includes the suppressed x and lets
+    // prediction resume from the corrected cursor.
+    let _ = pipe.on_host_bytes(b"\x1b[H\x1b[Kabx");
+    let _ = pipe.set_frames_late_for_test(12, 12, 12);
+    let _ = pipe.on_keystroke(b"y");
+    assert_eq!(pipe.predictor().pending_known_char_at(3, 0), Some('y'));
+}
+
+#[test]
 fn kill_epoch_drains_matched_prefix() {
     let mut p = always();
     p.set_cursor(0, 0);

@@ -719,10 +719,11 @@ impl Predictor {
 
     /// Resume speculation only after the server has processed the erase and
     /// every subsequent input that was deliberately not predicted.
-    fn observe_late_ack(&mut self) {
-        if self
-            .erase_wait_until_late_ack
-            .is_some_and(|watermark| self.late_ack() >= watermark)
+    fn observe_late_ack(&mut self, host_updated: bool) {
+        if host_updated
+            && self
+                .erase_wait_until_late_ack
+                .is_some_and(|watermark| self.late_ack() >= watermark)
         {
             self.erase_wait_until_late_ack = None;
         }
@@ -1243,6 +1244,9 @@ pub struct DisplayPipeline {
     /// Stock-mosh notification bar. It is composed into the same framebuffer
     /// as prediction so PTY output still has exactly one paint path.
     notification: Option<String>,
+    /// Whether authoritative screen content arrived before the next frame
+    /// acknowledgement update. Ack-only packets must not release erase wait.
+    host_updated_since_frames: bool,
 }
 
 impl DisplayPipeline {
@@ -1257,6 +1261,7 @@ impl DisplayPipeline {
                 DisplayPreference::Always | DisplayPreference::Experimental
             ),
             notification: None,
+            host_updated_since_frames: false,
         }
     }
 
@@ -1311,7 +1316,8 @@ impl DisplayPipeline {
         let before_show = self.predictor.should_show();
         let before_flag = self.predictor.flagging();
         self.predictor.set_frames(sent, early_acked, late_acked);
-        self.predictor.observe_late_ack();
+        let host_updated = std::mem::take(&mut self.host_updated_since_frames);
+        self.predictor.observe_late_ack(host_updated);
         // Ack-only packets never call on_host_bytes; still Confirm/Pending drain.
         if before_pending > 0 || before_active {
             self.predictor.confirm(&self.host_fb);
@@ -1431,6 +1437,9 @@ impl DisplayPipeline {
 
     /// HostBytes (or raw hoststring) arrived from mosh-server.
     pub fn on_host_bytes(&mut self, hoststring: &[u8]) -> Vec<u8> {
+        if !hoststring.is_empty() {
+            self.host_updated_since_frames = true;
+        }
         // Structural scan must see sticky carry + this chunk (same reassembly
         // apply_ansi uses); otherwise split CSI like "\x1b[2" + "@" misses ICH.
         let structural_scan: Vec<u8> = if self.pen.carry.is_empty() {
@@ -1474,6 +1483,9 @@ impl DisplayPipeline {
     /// before prediction. It also preserves the state's unique scroll marker,
     /// which prevents pending glyphs from surviving on the wrong row.
     pub fn on_host_frame(&mut self, frame: &Framebuffer) -> Vec<u8> {
+        if !frame.diff(Some(&self.host_fb)).is_empty() {
+            self.host_updated_since_frames = true;
+        }
         let geometry = self.host_fb.cols != frame.cols
             || self.host_fb.rows != frame.rows
             || self.host_fb.scroll_generation != frame.scroll_generation;
