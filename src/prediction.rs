@@ -10,7 +10,7 @@
 //! - Underline **flagging** hysteresis (80/50 ms), separate from show
 //! - Overlay: blank-on-blank no under; unknown underline-only (skip last col);
 //!   known cells apply only when differing from host, then flag under
-//! - Insert/BS shift the **full remaining row** (stock); overwrite BS → space
+//! - Insert shifts the **full remaining row** (stock)
 //! - Glitch: any non-zero `glitch_trigger` forces show; `> REPAIR_COUNT` flags
 //! - Frame-ack Pending via late_ack (`echo_ack_num`) vs expiration_sent
 //!
@@ -93,7 +93,7 @@ struct CursorPrediction {
     expiration_sent: u64,
 }
 
-/// mosh-go pending list + stock tentative / frame-ack / flagging / BS / arrows.
+/// mosh-go pending list + stock tentative / frame-ack / flagging / arrows.
 #[derive(Debug)]
 pub struct Predictor {
     pending: Vec<Prediction>,
@@ -119,6 +119,10 @@ pub struct Predictor {
     /// hidden cursor does not erase the last confirmed cursor on the glass.
     cursors: Vec<CursorPrediction>,
     last_quick_confirmation: Option<Instant>,
+    /// Backspace makes the local cursor ambiguous until the server has echoed
+    /// every input sent while waiting. The watermark is the first unacked
+    /// local frame that must be observed before speculation can resume.
+    erase_wait_until_late_ack: Option<u64>,
     /// Stock predict_overwrite (env MOSH_PREDICTION_OVERWRITE).
     overwrite: bool,
 }
@@ -150,6 +154,7 @@ impl Predictor {
             local_frame_late_acked: 0,
             cursors: Vec::new(),
             last_quick_confirmation: None,
+            erase_wait_until_late_ack: None,
             overwrite: std::env::var("MOSH_PREDICTION_OVERWRITE")
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false),
@@ -271,7 +276,7 @@ impl Predictor {
 
     /// mosh-go `Active`.
     pub fn active(&self) -> bool {
-        // Include cursor-only prediction (arrows / BS with empty pending).
+        // Include cursor-only prediction (arrows / CR with empty pending).
         self.active
     }
 
@@ -282,6 +287,12 @@ impl Predictor {
             self.reset();
             return;
         }
+        if self.erase_wait_until_late_ack.is_some() {
+            if !input.is_empty() {
+                self.erase_wait_until_late_ack = Some(self.local_frame_sent.saturating_add(1));
+            }
+            return;
+        }
         let data: Vec<u8> = if self.esc_buf.is_empty() {
             input.to_vec()
         } else {
@@ -289,6 +300,22 @@ impl Predictor {
             v.extend_from_slice(input);
             v
         };
+        // Do not predict any part of a read that contains destructive editing.
+        // The complete byte slice is still forwarded to the server by the
+        // caller, but suppressing the whole local batch avoids repainting later
+        // bytes from a cursor position that the backspace made uncertain.
+        if data.iter().any(|byte| matches!(byte, 0x08 | 0x7f)) {
+            self.reset();
+            self.erase_wait_until_late_ack = Some(self.local_frame_sent.saturating_add(1));
+            return;
+        }
+        // Bulk paste: stock resets if >100 bytes; mosh-go always predicts.
+        // Check this only after destructive editing so large buffered reads
+        // containing erase bytes still engage the server-acknowledgement latch.
+        if data.len() > 100 {
+            self.reset();
+            return;
+        }
         let mut i = 0;
         while i < data.len() {
             if self.preference == DisplayPreference::Experimental {
@@ -336,15 +363,6 @@ impl Predictor {
 
     fn handle_decoded_char(&mut self, ch: char, fb: &Framebuffer) {
         if ch == '\u{FFFD}' {
-            self.become_tentative();
-            return;
-        }
-        // Stock: only DEL (0x7f) is predicted BS. BS (0x08) is Execute → tentative.
-        if ch == '\u{7f}' {
-            self.predict_backspace(fb);
-            return;
-        }
-        if ch == '\u{08}' {
             self.become_tentative();
             return;
         }
@@ -654,132 +672,6 @@ impl Predictor {
         self.sort_pending();
     }
 
-    fn predict_backspace(&mut self, fb: &Framebuffer) {
-        if self.cur_x == 0 {
-            return;
-        }
-        let cx = self.cur_x - 1;
-        let cy = self.cur_y;
-        // Fast path (insert mode only): undo last same-epoch glyph we just placed.
-        // Stock overwrite BS never undoes — it always predicts a space.
-        if !self.overwrite {
-            if let Some(last) = self.pending.last() {
-                if last.epoch == self.prediction_epoch
-                    && last.x == cx
-                    && last.y == cy
-                    && !last.unknown
-                {
-                    let only = !self
-                        .pending
-                        .iter()
-                        .any(|p| p.y == cy && p.x > cx && p.epoch == self.prediction_epoch);
-                    if only {
-                        self.pending.pop();
-                        self.cur_x = cx;
-                        self.active = true;
-                        self.record_cursor_prediction();
-                        return;
-                    }
-                }
-            }
-        }
-        // Overwrite-mode BS: stock clears cell to space (no row shift).
-        if self.overwrite {
-            let orig = fb.cell_at(cx, cy).map(|c| c.ch).unwrap_or(' ');
-            let previous = self
-                .pending
-                .iter()
-                .position(|p| p.y == cy && p.x == cx)
-                .map(|index| self.pending.remove(index));
-            let mut prediction = self.make_pred(' ', cx, cy, orig, false);
-            prediction.original_contents = prediction_history(previous.as_ref(), orig);
-            self.pending.push(prediction);
-            self.cur_x = cx;
-            self.active = true;
-            self.record_cursor_prediction();
-            self.sort_pending();
-            return;
-        }
-
-        // Stock insert-mode BS: for i from cursor to width-1, if i+2 < width copy
-        // from i+1 else mark unknown. That makes the *last two* columns unknown
-        // (penultimate never receives former last glyph) — match stock exactly.
-        let exp = self.local_frame_sent.saturating_add(1);
-        let ep = self.prediction_epoch;
-        let now = Instant::now();
-        let width = fb.cols;
-
-        let mut row: Vec<Option<Prediction>> = vec![None; width];
-        let mut rest = Vec::with_capacity(self.pending.len());
-        for p in self.pending.drain(..) {
-            if p.y == cy && p.x < width {
-                let x = p.x;
-                row[x] = Some(p);
-            } else {
-                rest.push(p);
-            }
-        }
-
-        let mut new_row: Vec<Option<Prediction>> = vec![None; width];
-        for x in cx..width {
-            let orig = fb.cell_at(x, cy).map(|c| c.ch).unwrap_or(' ');
-            if x + 2 < width {
-                let (ch, unknown) = if let Some(next) = row[x + 1].as_ref() {
-                    if next.unknown {
-                        (' ', true)
-                    } else {
-                        (next.ch, false)
-                    }
-                } else {
-                    let src = fb.cell_at(x + 1, cy);
-                    let ch = src
-                        .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
-                        .unwrap_or(' ');
-                    (ch, false)
-                };
-                let original_contents = prediction_history(row[x].as_ref(), orig);
-                new_row[x] = Some(Prediction {
-                    ch,
-                    x,
-                    y: cy,
-                    epoch: ep,
-                    at: now,
-                    expiration_sent: exp,
-                    original_contents,
-                    unknown,
-                    overlay_attr: None,
-                });
-            } else {
-                // Stock: last two columns are unknown after insert-mode BS.
-                let original_contents = prediction_history(row[x].as_ref(), orig);
-                new_row[x] = Some(Prediction {
-                    ch: ' ',
-                    x,
-                    y: cy,
-                    epoch: ep,
-                    at: now,
-                    expiration_sent: exp,
-                    original_contents,
-                    unknown: true,
-                    overlay_attr: None,
-                });
-            }
-        }
-        // Keep columns left of cx unchanged from prior row map.
-        for x in 0..cx {
-            new_row[x] = row[x].take();
-        }
-
-        self.pending = rest;
-        for cell in new_row.into_iter().flatten() {
-            self.pending.push(cell);
-        }
-        self.cur_x = cx;
-        self.active = true;
-        self.record_cursor_prediction();
-        self.sort_pending();
-    }
-
     /// Stock become_tentative: bump prediction_epoch only.
     /// Existing pending stay; those with epoch > confirmed_epoch are hidden.
     pub fn become_tentative(&mut self) {
@@ -823,6 +715,18 @@ impl Predictor {
         // Stock reset does not zero glitch_trigger / last_quick_confirmation.
         self.esc_buf.clear();
         self.cursors.clear();
+    }
+
+    /// Resume speculation only after the server has processed the erase and
+    /// every subsequent input that was deliberately not predicted.
+    fn observe_late_ack(&mut self, host_updated: bool) {
+        if host_updated
+            && self
+                .erase_wait_until_late_ack
+                .is_some_and(|watermark| self.late_ack() >= watermark)
+        {
+            self.erase_wait_until_late_ack = None;
+        }
     }
 
     /// mosh-go `SetCursor` — only tracks server cursor when inactive.
@@ -1340,6 +1244,9 @@ pub struct DisplayPipeline {
     /// Stock-mosh notification bar. It is composed into the same framebuffer
     /// as prediction so PTY output still has exactly one paint path.
     notification: Option<String>,
+    /// Whether authoritative screen content arrived before the next frame
+    /// acknowledgement update. Ack-only packets must not release erase wait.
+    host_updated_since_frames: bool,
 }
 
 impl DisplayPipeline {
@@ -1354,6 +1261,7 @@ impl DisplayPipeline {
                 DisplayPreference::Always | DisplayPreference::Experimental
             ),
             notification: None,
+            host_updated_since_frames: false,
         }
     }
 
@@ -1408,6 +1316,8 @@ impl DisplayPipeline {
         let before_show = self.predictor.should_show();
         let before_flag = self.predictor.flagging();
         self.predictor.set_frames(sent, early_acked, late_acked);
+        let host_updated = std::mem::take(&mut self.host_updated_since_frames);
+        self.predictor.observe_late_ack(host_updated);
         // Ack-only packets never call on_host_bytes; still Confirm/Pending drain.
         if before_pending > 0 || before_active {
             self.predictor.confirm(&self.host_fb);
@@ -1527,6 +1437,9 @@ impl DisplayPipeline {
 
     /// HostBytes (or raw hoststring) arrived from mosh-server.
     pub fn on_host_bytes(&mut self, hoststring: &[u8]) -> Vec<u8> {
+        if !hoststring.is_empty() {
+            self.host_updated_since_frames = true;
+        }
         // Structural scan must see sticky carry + this chunk (same reassembly
         // apply_ansi uses); otherwise split CSI like "\x1b[2" + "@" misses ICH.
         let structural_scan: Vec<u8> = if self.pen.carry.is_empty() {
@@ -1570,6 +1483,9 @@ impl DisplayPipeline {
     /// before prediction. It also preserves the state's unique scroll marker,
     /// which prevents pending glyphs from surviving on the wrong row.
     pub fn on_host_frame(&mut self, frame: &Framebuffer) -> Vec<u8> {
+        if !frame.diff(Some(&self.host_fb)).is_empty() {
+            self.host_updated_since_frames = true;
+        }
         let geometry = self.host_fb.cols != frame.cols
             || self.host_fb.rows != frame.rows
             || self.host_fb.scroll_generation != frame.scroll_generation;
@@ -1601,16 +1517,6 @@ impl DisplayPipeline {
         if !self.predictor.active() {
             self.predictor
                 .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
-        }
-        // Bulk paste: stock resets if >100 bytes; mosh-go always predicts.
-        // Prefer stock safety for huge pastes.
-        if keys.len() > 100 {
-            self.predictor.reset();
-            if self.predictor.should_show() || self.notification.is_some() {
-                self.using_overlay_path = true;
-                return self.render_overlay_path();
-            }
-            return Vec::new();
         }
         self.predictor.keystroke(keys, &self.host_fb);
         // Background Adaptive: build pending without painting.
