@@ -1,6 +1,6 @@
 [package]
 name = "moshmagies"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 rust-version = "1.75"
 description = "MoshMagies — pure Rust Mosh client, wire-compatible with stock mosh-server"

@@ -92,6 +92,7 @@ Download the archive for your platform from the [latest release](https://github.
 | `mosh-client-linux-arm64.tar.gz` | Linux aarch64 |
 | `mosh-client-darwin-universal.tar.gz` | macOS universal |
 | `mosh-client-win32-x64.tar.gz` | Windows x64 |
+| `mosh-client-win32-arm64.tar.gz` | Windows arm64 |
 
 ```sh
 # Example: Linux x64
@@ -272,6 +273,7 @@ mosh-client-linux-x64.tar.gz
 mosh-client-linux-arm64.tar.gz
 mosh-client-darwin-universal.tar.gz
 mosh-client-win32-x64.tar.gz
+mosh-client-win32-arm64.tar.gz
 SHA256SUMS
 ```
 
