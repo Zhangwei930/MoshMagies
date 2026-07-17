@@ -1,5 +1,5 @@
 {
-  "name": "moshcatty-ci",
+  "name": "moshmagies-ci",
   "private": true,
   "scripts": {
     "test:conpty": "node tests/windows-conpty-input.cjs"

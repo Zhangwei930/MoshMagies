@@ -1,18 +1,18 @@
-//! Integration-style tests against the public `moshcatty` API.
+//! Integration-style tests against the public `moshmagies` API.
 //!
 //! Cases adapted from:
 //! - unixshells/mosh-go (`ocb_test`, `fragment_test`, `pb_test`, `transport_test`)
 //! - RFC 7253 Appendix A (AES-128-OCB empty AAD)
 //! - End-to-end client path exercising shipped modules only
 
-use moshcatty::crypto::{
+use moshmagies::crypto::{
     pack_timestamps, unpack_timestamps, Ocb, DIR_TO_CLIENT, DIR_TO_SERVER, MIN_DATAGRAM, SEQ_MASK,
 };
-use moshcatty::fragment::{fragmentize, Assembler, Fragment, MAX_FRAGMENT_PAYLOAD};
-use moshcatty::pb::{HostInstruction, TransportInstruction, UserInstruction};
-use moshcatty::terminal::{strip_ansi, TerminalView};
-use moshcatty::transport::Transport;
-use moshcatty::Client;
+use moshmagies::fragment::{fragmentize, Assembler, Fragment, MAX_FRAGMENT_PAYLOAD};
+use moshmagies::pb::{HostInstruction, TransportInstruction, UserInstruction};
+use moshmagies::terminal::{strip_ansi, TerminalView};
+use moshmagies::transport::Transport;
+use moshmagies::Client;
 
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};

@@ -4,7 +4,7 @@
 # Usage: assert-max-glibc.sh <binary> <max_version>
 # Example: assert-max-glibc.sh target/release/mosh-client 2.28
 #
-# Netcatty packaging floors (must stay in sync with Netcatty CI):
+# MagiesTerminal packaging floors (must stay in sync with MagiesTerminal CI):
 #   linux-x64   → glibc 2.28  (almalinux:8)
 #   linux-arm64 → glibc 2.31  (debian:bullseye)
 set -euo pipefail
@@ -59,7 +59,7 @@ echo "max required: $MAX_SEEN (floor: $MAX)"
 
 if ! version_le "$MAX_SEEN" "$MAX"; then
   echo "ERROR: $BIN requires GLIBC_$MAX_SEEN > floor GLIBC_$MAX" >&2
-  echo "Build on a container matching Netcatty's Linux compatibility floor." >&2
+  echo "Build on a container matching MagiesTerminal's Linux compatibility floor." >&2
   exit 1
 fi
 

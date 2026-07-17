@@ -1,8 +1,8 @@
 # Local prediction (speculative echo)
 
 Status: **best-within-constraints** — stock overlay/keystroke/confirm semantics on a pure-Rust Diff paint path  
-Related: [Netcatty #2121](https://github.com/binaricat/Netcatty/issues/2121),
-[Netcatty #2275](https://github.com/binaricat/Netcatty/issues/2275)
+Related: [MagiesTerminal #2121](https://github.com/Zhangwei930/MgTerminal/issues/2121),
+[MagiesTerminal #2275](https://github.com/Zhangwei930/MgTerminal/issues/2275)
 
 ## Architecture (must not change)
 
@@ -47,14 +47,14 @@ Never require terminfo / Cygwin / system mosh. Pure Rust standalone binary only.
 | `MOSH_PREDICTION_DISPLAY` | `adaptive` (default) / `always` / `never` / `experimental` |
 | `MOSH_PREDICTION_OVERWRITE` | `yes`/`true`/`1` → overwrite instead of insert |
 
-## Explicit non-goals (preserve MoshCatty advantages)
+## Explicit non-goals (preserve MoshMagies advantages)
 
 | Deferred | Why |
 |----------|-----|
 | System / Cygwin mosh-client / terminfo | Pure single-binary is the product |
 | Full VTE emulator | HostBytes+Diff under node-pty is the fit |
 | Bit-identical Diff vs stock `new_frame` | Different encoder; cell semantics matter |
-| Title prefix chrome | Netcatty owns the session title |
+| Title prefix chrome | MagiesTerminal owns the session title |
 | Scroll-history / up-down arrow prediction | Stock also defers / absent |
 
 ## Modules

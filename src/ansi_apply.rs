@@ -184,7 +184,7 @@ pub fn apply_ansi_with_pen(fb: &mut Framebuffer, pen: &mut AnsiPen, data: &[u8])
     }
 }
 
-/// Width of a standalone codepoint in Netcatty's xterm.js Unicode 15
+/// Width of a standalone codepoint in MagiesTerminal's xterm.js Unicode 15
 /// grapheme provider. Unlike `unicode-width`/server libc, supplementary-plane
 /// emoji and CJK extensions are narrow until a grapheme sequence widens them.
 fn xterm_standalone_width(ch: char) -> usize {
@@ -962,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn xterm_standalone_width_boundary_matches_netcatty_unicode_provider() {
+    fn xterm_standalone_width_boundary_matches_magiesterminal_unicode_provider() {
         for (ch, expected) in [
             ('\u{ffff}', 1),
             ('\u{10000}', 1),

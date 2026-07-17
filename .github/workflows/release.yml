@@ -1,24 +1,24 @@
 name: release
 
 # Build multi-platform mosh-client archives and publish a GitHub Release.
-# Tags: moshcatty-0.1.4  (consumed by Netcatty fetch-mosh-binaries)
+# Tags: moshmagies-0.1.4  (consumed by MagiesTerminal fetch-mosh-binaries)
 #
-# Linux builds intentionally target Netcatty's packaging glibc floors:
+# Linux builds intentionally target MagiesTerminal's packaging glibc floors:
 #   linux-x64   → almalinux:8      (glibc 2.28)
 #   linux-arm64 → debian:bullseye  (glibc 2.31)
-# so bundled mosh-client starts on the same distros as Netcatty itself.
+# so bundled mosh-client starts on the same distros as MagiesTerminal itself.
 #
 # Manual: workflow_dispatch with version
-# Auto:   push of tags matching moshcatty-*
+# Auto:   push of tags matching moshmagies-*
 
 on:
   push:
     tags:
-      - "moshcatty-*"
+      - "moshmagies-*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version without prefix (e.g. 0.1.4 → tag moshcatty-0.1.4)"
+        description: "Release version without prefix (e.g. 0.1.4 → tag moshmagies-0.1.4)"
         required: true
         type: string
 
@@ -31,7 +31,7 @@ env:
 jobs:
   build-linux-x64:
     runs-on: ubuntu-latest
-    # Match Netcatty build-linux-x64: AlmaLinux 8 / glibc 2.28.
+    # Match MagiesTerminal build-linux-x64: AlmaLinux 8 / glibc 2.28.
     container:
       image: almalinux:8
     steps:
@@ -61,7 +61,7 @@ jobs:
 
   build-linux-arm64:
     runs-on: ubuntu-24.04-arm
-    # Match Netcatty build-linux-arm64: Debian bullseye / glibc 2.31.
+    # Match MagiesTerminal build-linux-arm64: Debian bullseye / glibc 2.31.
     container:
       image: debian:bullseye
     defaults:
@@ -203,7 +203,7 @@ jobs:
         id: tag
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=moshcatty-${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "tag=moshmagies-${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
@@ -214,9 +214,9 @@ jobs:
           name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           body: |
-            Pure Rust `mosh-client` for Netcatty.
+            Pure Rust `mosh-client` for MagiesTerminal.
 
-            **Linux glibc floors** (must match Netcatty packaging):
+            **Linux glibc floors** (must match MagiesTerminal packaging):
             - `linux-x64`: built on AlmaLinux 8 → GLIBC ≤ 2.28
             - `linux-arm64`: built on Debian bullseye → GLIBC ≤ 2.31
             - Windows: static MSVC CRT (no VCRUNTIME140)

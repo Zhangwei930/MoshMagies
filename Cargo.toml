@@ -1,16 +1,16 @@
 [package]
-name = "moshcatty"
+name = "moshmagies"
 version = "0.1.8"
 edition = "2021"
 rust-version = "1.75"
-description = "MoshCatty — pure Rust Mosh client, wire-compatible with stock mosh-server"
+description = "MoshMagies — pure Rust Mosh client, wire-compatible with stock mosh-server"
 license = "GPL-3.0-or-later"
 publish = false
-authors = ["binaricat", "Netcatty contributors"]
-repository = "https://github.com/binaricat/MoshCatty"
-homepage = "https://github.com/binaricat/MoshCatty"
+authors = ["binaricat", "MagiesTerminal contributors"]
+repository = "https://github.com/Zhangwei930/MoshMagies"
+homepage = "https://github.com/Zhangwei930/MoshMagies"
 readme = "README.md"
-keywords = ["mosh", "ssh", "terminal", "udp", "netcatty"]
+keywords = ["mosh", "ssh", "terminal", "udp", "magiesterminal"]
 categories = ["command-line-utilities", "network-programming"]
 
 [features]
@@ -21,7 +21,7 @@ name = "mosh-client"
 path = "src/bin/mosh_client.rs"
 
 [lib]
-name = "moshcatty"
+name = "moshmagies"
 path = "src/lib.rs"
 
 [dependencies]

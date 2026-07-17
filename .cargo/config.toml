@@ -1,7 +1,7 @@
 # Windows MSVC: link the C runtime statically so mosh-client.exe does not
 # depend on VCRUNTIME140.dll / UCRT API-set DLLs (api-ms-win-crt-*.dll).
 # Those are missing on some clean Windows installs without the VC++
-# redistributable; Netcatty ships this binary as a single-file extraResource.
+# redistributable; MagiesTerminal ships this binary as a single-file extraResource.
 #
 # Remaining imports are OS always-present modules (kernel32, ntdll, ws2_32, …).
 # See README "Windows CRT".
