@@ -309,6 +309,13 @@ impl Predictor {
             self.erase_wait_until_late_ack = Some(self.local_frame_sent.saturating_add(1));
             return;
         }
+        // Bulk paste: stock resets if >100 bytes; mosh-go always predicts.
+        // Check this only after destructive editing so large buffered reads
+        // containing erase bytes still engage the server-acknowledgement latch.
+        if data.len() > 100 {
+            self.reset();
+            return;
+        }
         let mut i = 0;
         while i < data.len() {
             if self.preference == DisplayPreference::Experimental {
@@ -1498,16 +1505,6 @@ impl DisplayPipeline {
         if !self.predictor.active() {
             self.predictor
                 .set_cursor(self.host_fb.cur_x, self.host_fb.cur_y);
-        }
-        // Bulk paste: stock resets if >100 bytes; mosh-go always predicts.
-        // Prefer stock safety for huge pastes.
-        if keys.len() > 100 {
-            self.predictor.reset();
-            if self.predictor.should_show() || self.notification.is_some() {
-                self.using_overlay_path = true;
-                return self.render_overlay_path();
-            }
-            return Vec::new();
         }
         self.predictor.keystroke(keys, &self.host_fb);
         // Background Adaptive: build pending without painting.

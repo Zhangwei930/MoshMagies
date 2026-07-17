@@ -344,6 +344,22 @@ fn backspace_cancels_prediction_for_the_entire_input_batch() {
 }
 
 #[test]
+fn backspace_in_a_large_input_batch_still_pauses_local_echo() {
+    let mut pipe = DisplayPipeline::new(140, 10, DisplayPreference::Always);
+    pipe.prove_band_for_test();
+    let _ = pipe.on_host_bytes(b"prompt# ");
+    let _ = pipe.set_frames_late_for_test(10, 10, 10);
+
+    let mut input = vec![b'a'; 100];
+    input.push(0x7f);
+    assert!(pipe.on_keystroke(&input).is_empty());
+    let _ = pipe.set_frames_late_for_test(11, 10, 10);
+
+    assert!(pipe.on_keystroke(b"x").is_empty());
+    assert_eq!(pipe.predictor().pending_len(), 0);
+}
+
+#[test]
 fn backspace_waits_for_a_host_frame_before_local_echo_resumes() {
     let mut pipe = DisplayPipeline::new(40, 10, DisplayPreference::Always);
     pipe.prove_band_for_test();
